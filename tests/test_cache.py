@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from gandalf import cache, plugins
-from gandalf.base import GateOutcome, GateResult
+from gandalf.base import Gate, GateOutcome, GateResult
 
 
 def test_content_hash_changes_with_file_content(tmp_path: Path) -> None:
@@ -151,7 +151,7 @@ class _Named:
 def test_merging_without_a_cache_keeps_a_result_the_gate_list_cannot_claim() -> None:
     """Ordering the report by the gate list is presentation; it must not also
     decide which results exist."""
-    active = [_Named("ruff"), _Named("wrapper")]
+    active = cast("list[Gate]", [_Named("ruff"), _Named("wrapper")])
     fresh = [
         GateResult("wrapper-inner", GateOutcome.PASS, 1.0, "renamed itself"),
         GateResult("ruff", GateOutcome.PASS, 1.0, "clean"),
@@ -172,8 +172,33 @@ def test_merging_survives_a_cache_entry_that_expired_mid_run(tmp_path: Path) -> 
     data["trivy"]["ts"] -= cache.ADVISORY_TTL + 1  # expired since `pending` said "hit"
     plan = cache.Plan(path, data, "h1")
 
-    active = [_Named("ruff"), _Named("trivy")]
+    active = cast("list[Gate]", [_Named("ruff"), _Named("trivy")])
     fresh = [GateResult("ruff", GateOutcome.PASS, 1.0, "clean")]
     merged, cached = plan.merge(fresh, active, [active[0]])
     assert cached == []
     assert [r.name for r in merged] == ["ruff"]
+
+
+def test_a_finished_gate_is_banked_before_the_run_ends(tmp_path: Path) -> None:
+    """The run that most needs a cache is the one that never reaches the end —
+    an editor scan killed at its timeout. Each result has to be on disk as it
+    lands, not after the last gate."""
+    path = str(tmp_path / "c.json")
+    plan = cache.Plan(path, {}, "h1")
+
+    plan.record(GateResult("ruff", GateOutcome.PASS, 1.0, "clean"))
+
+    hit = cache.get(cache.load(path), "ruff", "h1")  # nothing else has run yet
+    assert hit is not None
+    assert hit.summary == "clean"
+
+
+def test_a_gate_that_did_not_run_is_not_banked(tmp_path: Path) -> None:
+    """ "tool missing" and "timed out" are not answers to keep for six hours:
+    caching them would make one bad run stick to every run after it."""
+    path = str(tmp_path / "c.json")
+    plan = cache.Plan(path, {}, "h1")
+
+    plan.record(plugins.unavailable("trivy", "trivy: did not run"))
+
+    assert cache.get(cache.load(path), "trivy", "h1") is None

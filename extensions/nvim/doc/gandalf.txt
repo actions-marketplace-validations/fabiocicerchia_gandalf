@@ -84,8 +84,9 @@ Defaults, deep-merged with whatever you pass: >lua
         timeout_ms = 600000,
         concurrency = 0,        -- 0 leaves gandalf's default
         use_cache = true,
-        llm = false,
+        llm = false,            -- off also skips the LLM judge gates
         stream = true,
+        debug = false,          -- gandalf's own trace into |:GandalfLog|
       },
       diagnostics = {
         enabled = true,
@@ -146,7 +147,12 @@ Defaults, deep-merged with whatever you pass: >lua
 :GandalfCancel          Stop the running scan.
 
                                                                  *:GandalfLog*
-:GandalfLog             What was run, and what came back.
+:GandalfLog             What was run, and what came back. With `scan.debug`
+                        on, also gandalf's own elapsed-stamped trace: every
+                        stage, every gate's start and duration, and every
+                        command it shells out to. That is the only account of
+                        a scan that hits `timeout_ms`, since such a run never
+                        writes a report.
 
 ==============================================================================
 6. API                                                            *gandalf-api*
@@ -183,6 +189,14 @@ Checks gandalf itself, whether the build supports `--stream`, git, the
 scanner-tools image, and the endpoint the judge gates call. Deliberately not a
 tool-by-tool inventory: gandalf answers that per gate on every scan, and a copy
 of its tool list here would only drift.
+
+The scan path asks the same question for itself. `--help` is run once per
+`cmd` and remembered, and the optional flags -- `--out-dir`, `--no-trend`,
+`--cache`, `--stream`, `--exclude` -- are withheld from a build that did not
+report them. gandalf's own argument parser rejects an unknown flag with exit
+2, so passing one to an older build fails the scan outright rather than
+running it without that flag. If the probe cannot run at all, nothing is
+withheld, which is what the plugin did before it existed.
 
 ==============================================================================
 9. DIFFERENCES FROM THE VS CODE EXTENSION                 *gandalf-differences*

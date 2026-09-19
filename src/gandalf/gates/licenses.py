@@ -1,18 +1,30 @@
-"""Dependency-license gate — flags forbidden / restricted licenses via trivy's
-license scanner (reuses the trivy binary already in the image). Permissive
-licenses (LOW/UNKNOWN severity) are ignored so only real obligations surface."""
+"""Dependency-license gate — flags forbidden / restricted licenses out of the
+run's `trivy fs` scan, which already asks for licences alongside everything else
+it reads. Permissive licenses (LOW/UNKNOWN severity) are ignored so only real
+obligations surface."""
 
 from __future__ import annotations
 
-import json
+from typing import Any
 
 from gandalf.base import GateContext, GateOutcome, GateResult
+from gandalf.gates._toolchain import obj, objects, parsed, scored, trivy_scan
 from gandalf.plugins import (
     missing_result,
-    run_tool,
     timeout_result,
     unavailable,
 )
+
+
+def _flagged(data: object) -> list[dict[str, Any]]:
+    """trivy's license findings that carry an obligation. LOW and UNKNOWN are
+    the permissive ones and are not worth reporting."""
+    return [
+        lc
+        for r in objects(obj(data).get("Results"))
+        for lc in objects(r.get("Licenses"))
+        if lc.get("Severity") not in ("LOW", "UNKNOWN")
+    ]
 
 
 class LicensesGate:
@@ -21,45 +33,20 @@ class LicensesGate:
     category = "Licensing"
 
     async def run(self, ctx: GateContext) -> GateResult:
-        if (
-            m := missing_result(self.name, "trivy", tool="licenses: trivy")
-        ) is not None:
+        if (m := missing_result(self.name, "trivy", tool="licenses: trivy")) is not None:
             return m
-        rc, out, _ = await run_tool(
-            [
-                "trivy",
-                "fs",
-                "--scanners",
-                "license",
-                "--format",
-                "json",
-                "--quiet",
-                "--skip-dirs",
-                "reports",
-                "--skip-dirs",
-                "node_modules",
-                "--skip-dirs",
-                "llama.cpp",
-                ".",
-            ],
-            ctx.workdir,
-        )
+        # The scan the supply-chain gate runs, not one of its own: it already
+        # asks trivy for licences, and a second `trivy fs` is a second walk of
+        # the whole repository for answers the first one has.
+        rc, out = await trivy_scan(ctx)
         if (to := timeout_result(self.name, rc)) is not None:
             return to
-        try:
-            data = json.loads(out or "{}")
-        except json.JSONDecodeError:
+        data = parsed(out)
+        if data is None:
             return unavailable(self.name, "licenses: unparsable output")
-        lic = [
-            lc
-            for r in data.get("Results", [])
-            for lc in (r.get("Licenses") or [])
-            if lc.get("Severity") not in ("LOW", "UNKNOWN")  # skip permissive
-        ]
+        lic = _flagged(data)
         if not lic:
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "licenses: no problematic licenses"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "licenses: no problematic licenses")
         bad = [lc for lc in lic if lc.get("Severity") in ("CRITICAL", "HIGH")]
         findings = [
             {
@@ -68,12 +55,10 @@ class LicensesGate:
             }
             for lc in lic
         ]
-        score = max(0.0, 1.0 - min(len(lic), 10) / 10)
-        outcome = GateOutcome.FAIL if bad else GateOutcome.WARN
-        return GateResult(
+        return scored(
             self.name,
-            outcome,
-            score,
+            len(lic),
             f"licenses: {len(lic)} flagged ({len(bad)} forbidden/restricted)",
             findings,
+            fail=bool(bad),
         )

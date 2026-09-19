@@ -84,8 +84,9 @@ require('gandalf').setup({
     timeout_ms = 600000,
     concurrency = 0,   -- 0 leaves gandalf's default (CPU count)
     use_cache = true,  -- --cache, workspace scans only
-    llm = false,
+    llm = false,       -- off also skips the LLM judge gates, not just the summary
     stream = true,     -- read per-gate results as they land
+    debug = false,     -- gandalf's elapsed-stamped trace into `:GandalfLog`
   },
 
   diagnostics = {
@@ -121,7 +122,7 @@ rather than a nil index inside a callback a minute into a scan.
 | `:GandalfTimings` | Per-gate wall clock; picking one copies a skip list |
 | `:GandalfHistory` | Score over time, from the trend log and `git log` |
 | `:GandalfCancel` | Stop the running scan |
-| `:GandalfLog` | What was run, and what came back |
+| `:GandalfLog` | What was run, and what came back — plus gandalf's own per-stage, per-gate, per-command trace when `scan.debug` is on, which is the only place a scan that hits `timeout_ms` is accounted for |
 
 ## Why a scan is not on every keystroke
 
@@ -159,8 +160,26 @@ differs.
 ## Development
 
 ```sh
-make test    # 44 specs, headless, exactly as CI runs them
+make test    # 94 specs, headless, exactly as CI runs them
 ```
+
+One job per module:
+
+| Module | What it is |
+|---|---|
+| `init.lua` | `setup()`, the triggers, and the public API it re-exports |
+| `state.lua` | what the plugin knows right now: config, snapshot, run, log |
+| `scan.lua` | running gandalf once, and the policy about when it may |
+| `commands.lua` | what the `:Gandalf*` commands do |
+| `ui.lua` | diagnostics, the floats and the quickfix list |
+| `health.lua` | `:checkhealth gandalf`, one function per section |
+| `config.lua` | defaults, and the validation that turns a typo into a message |
+| `core/` | reading what gandalf says, with no `vim.` call in it |
+
+`core.lua` re-exports `core/argv`, `core/levels`, `core/fields`,
+`core/findings`, `core/packages`, `core/gates`, `core/stream` and `core/trend`,
+so `require('gandalf.core')` stays the one spelling — the same way gandalf's own
+`plugins.py` re-exports `toolrun`, `ignores` and `outcomes`.
 
 `tests/smoke.lua` drives the plugin against the real CLI and a real git
 repository with nothing else on the runtimepath — that is what CI's smoke job

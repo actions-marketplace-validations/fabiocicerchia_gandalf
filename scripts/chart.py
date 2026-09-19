@@ -12,6 +12,7 @@ it costs almost nothing.
 
 from __future__ import annotations
 
+from typing import Any
 from xml.sax.saxutils import escape
 
 # Validated with the dataviz palette validator (six checks, both modes):
@@ -45,6 +46,13 @@ ROW_GAP = 13
 PANEL_GAP = 34
 
 
+# Axis tick spacing switches at these magnitudes.
+HUNDRED = 100
+TEN = 10
+# A run this much slower than baseline is a regression worth flagging.
+REGRESSION_FACTOR = 1.15
+
+
 def _nice_max(v: float) -> float:
     """A round number at or above `v`, so the gridlines land somewhere sane."""
     if v <= 0:
@@ -59,18 +67,53 @@ def _nice_max(v: float) -> float:
 
 
 def _fmt(v: float) -> str:
-    if v >= 100:
+    if v >= HUNDRED:
         return f"{v:.0f}"
-    if v >= 10:
+    if v >= TEN:
         return f"{v:.1f}"
     return f"{v:.2f}".rstrip("0").rstrip(".")
 
 
-def _row_height(row: dict) -> int:
+def _row_height(row: dict[str, Any]) -> int:
     return BAR * 2 + PAIR_GAP if row.get("before") is not None else BAR
 
 
-def _panel(rows: list[dict], unit: str, title: str, top: int) -> tuple[list[str], int]:
+def _row_svg(row: dict[str, Any], ry: int, plot: int, ceiling: float, unit: str) -> list[str]:
+    """One row: its label, one or two bars, and the before/after factor."""
+    out = [
+        (
+            f'<text x="{GUTTER - 12}" y="{ry + _row_height(row) / 2 + 4:.1f}" '
+            f'class="label" text-anchor="end">{escape(row["label"])}</text>'
+        )
+    ]
+    if row.get("before") is not None:
+        bars = [
+            ("before", row["before"], ry),
+            ("after", row["after"], ry + BAR + PAIR_GAP),
+        ]
+    else:
+        bars = [("after", row["after"], ry)]
+    for series, value, by in bars:
+        # A 1px floor, so a genuinely negligible cost is visible as
+        # negligible rather than absent.
+        w = max(1.0, plot * value / ceiling)
+        out.append(
+            f'<rect x="{GUTTER}" y="{by}" width="{w:.1f}" height="{BAR}" '
+            f'rx="4" class="bar {series}"><title>{escape(row["label"])} — '
+            f"{series} {_fmt(value)} {escape(unit)}</title></rect>"
+        )
+        out.append(f'<text x="{GUTTER + w + 8:.1f}" y="{by + BAR - 3}" class="value">{_fmt(value)}</text>')
+    if row.get("before") is not None and row["after"] > 0:
+        factor = row["before"] / row["after"]
+        if factor >= REGRESSION_FACTOR:
+            out.append(
+                f'<text x="{WIDTH - 2}" y="{ry + _row_height(row) / 2 + 4:.1f}" '
+                f'class="delta" text-anchor="end">{factor:.1f}x</text>'
+            )
+    return out
+
+
+def _panel(rows: list[dict[str, Any]], unit: str, title: str, top: int) -> tuple[list[str], int]:
     """One panel: a titled group of bars sharing a single axis."""
     out: list[str] = []
     plot = WIDTH - GUTTER - RIGHT
@@ -84,7 +127,7 @@ def _panel(rows: list[dict], unit: str, title: str, top: int) -> tuple[list[str]
     y += 20
 
     axis_top = y
-    body_rows: list[tuple[dict, int]] = []
+    body_rows: list[tuple[dict[str, Any], int]] = []
     for row in rows:
         body_rows.append((row, y))
         y += _row_height(row) + ROW_GAP
@@ -93,52 +136,21 @@ def _panel(rows: list[dict], unit: str, title: str, top: int) -> tuple[list[str]
     # Grid first, so every mark sits on top of it.
     for i in range(5):
         gx = GUTTER + plot * i / 4
-        out.append(
-            f'<line x1="{gx:.1f}" y1="{axis_top - 4}" x2="{gx:.1f}" y2="{axis_bottom}" class="grid"/>'
-        )
+        out.append(f'<line x1="{gx:.1f}" y1="{axis_top - 4}" x2="{gx:.1f}" y2="{axis_bottom}" class="grid"/>')
         out.append(
             f'<text x="{gx:.1f}" y="{axis_bottom + 14}" class="tick" text-anchor="middle">'
             f"{_fmt(ceiling * i / 4)}</text>"
         )
 
     for row, ry in body_rows:
-        out.append(
-            f'<text x="{GUTTER - 12}" y="{ry + _row_height(row) / 2 + 4:.1f}" '
-            f'class="label" text-anchor="end">{escape(row["label"])}</text>'
-        )
-        bars = []
-        if row.get("before") is not None:
-            bars.append(("before", row["before"], ry))
-            bars.append(("after", row["after"], ry + BAR + PAIR_GAP))
-        else:
-            bars.append(("after", row["after"], ry))
-        for series, value, by in bars:
-            # A 1px floor, so a genuinely negligible cost is visible as
-            # negligible rather than absent.
-            w = max(1.0, plot * value / ceiling)
-            out.append(
-                f'<rect x="{GUTTER}" y="{by}" width="{w:.1f}" height="{BAR}" '
-                f'rx="4" class="bar {series}"><title>{escape(row["label"])} — '
-                f"{series} {_fmt(value)} {escape(unit)}</title></rect>"
-            )
-            out.append(
-                f'<text x="{GUTTER + w + 8:.1f}" y="{by + BAR - 3}" class="value">'
-                f"{_fmt(value)}</text>"
-            )
-        if row.get("before") is not None and row["after"] > 0:
-            factor = row["before"] / row["after"]
-            if factor >= 1.15:
-                out.append(
-                    f'<text x="{WIDTH - 2}" y="{ry + _row_height(row) / 2 + 4:.1f}" '
-                    f'class="delta" text-anchor="end">{factor:.1f}x</text>'
-                )
+        out += _row_svg(row, ry, plot, ceiling, unit)
 
     return out, axis_bottom + 24
 
 
-def render(rows: list[dict]) -> str:
+def render(rows: list[dict[str, Any]]) -> str:
     """The whole figure. `rows` is what bench.py measured."""
-    by_unit: dict[str, list[dict]] = {}
+    by_unit: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
         by_unit.setdefault(r["unit"], []).append(r)
     for group in by_unit.values():

@@ -2,30 +2,40 @@
 
 from __future__ import annotations
 
-import os
+from pathlib import Path
+
+import pytest
 
 from gandalf import config
+from gandalf.base import GateContext, GateOutcome, GateResult
 
 
 class _G:
-    def __init__(self, name):
+    blocking = False
+
+    def __init__(self, name: str) -> None:
         self.name = name
 
+    async def run(self, ctx: GateContext) -> GateResult:
+        return GateResult(self.name, GateOutcome.PASS, 1.0, "ok")
 
-def _write(tmp, text):
-    p = os.path.join(tmp, ".gandalf.toml")
-    with open(p, "w") as fh:
+
+def _write(tmp: Path | str, text: str) -> str:
+    p = str(Path(tmp) / ".gandalf.toml")
+    with Path(p).open("w") as fh:
         fh.write(text)
     return p
 
 
-def test_missing_config_is_empty(tmp_path):
+def test_missing_config_is_empty(tmp_path: Path) -> None:
     c = config.load(str(tmp_path))
-    assert c.only == set() and c.skip == set()
-    assert c.path == "" and c.concurrency is None
+    assert c.only == set()
+    assert c.skip == set()
+    assert c.path == ""
+    assert c.concurrency is None
 
 
-def test_load_and_sections(tmp_path):
+def test_load_and_sections(tmp_path: Path) -> None:
     _write(
         str(tmp_path),
         "[gandalf]\nskip=['atheris']\nconcurrency=6\n[gandalf.verdict]\nfail_on='warn'\n",
@@ -38,24 +48,28 @@ def test_load_and_sections(tmp_path):
     assert c.section("nope") == {}
 
 
-def test_broken_config_falls_back(tmp_path):
+def test_broken_config_falls_back(tmp_path: Path) -> None:
     _write(str(tmp_path), "this is not = valid toml [[[")
     c = config.load(str(tmp_path))  # must not raise
-    assert c.only == set() and c.skip == set()
+    assert c.only == set()
+    assert c.skip == set()
 
 
-def test_select_only_and_skip():
+def test_select_only_and_skip() -> None:
     gates = [_G("ruff"), _G("mypy"), _G("gitleaks")]
     kept, disabled = config.Config({"only": ["ruff", "mypy"]}).select(gates)
-    assert {g.name for g in kept} == {"ruff", "mypy"} and disabled == ["gitleaks"]
+    assert {g.name for g in kept} == {"ruff", "mypy"}
+    assert disabled == ["gitleaks"]
     kept, disabled = config.Config({"skip": ["mypy"]}).select(gates)
-    assert {g.name for g in kept} == {"ruff", "gitleaks"} and disabled == ["mypy"]
+    assert {g.name for g in kept} == {"ruff", "gitleaks"}
+    assert disabled == ["mypy"]
     # skip wins over only
     kept, disabled = config.Config({"only": ["ruff"], "skip": ["ruff"]}).select(gates)
-    assert kept == [] and "ruff" in disabled
+    assert kept == []
+    assert "ruff" in disabled
 
 
-def test_explicit_and_env_paths(tmp_path, monkeypatch):
+def test_explicit_and_env_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     p = _write(str(tmp_path), "[gandalf]\nskip=['x']\n")
     assert config.load(None, p).skip == {"x"}
     monkeypatch.setenv("GANDALF_CONFIG", p)
@@ -77,4 +91,3 @@ if __name__ == "__main__":
         p = Path(d) / ".gandalf.toml"
         p.write_text("[gandalf]\nskip=['x']\n")
         assert config.load(None, str(p)).skip == {"x"}
-    print("ok")

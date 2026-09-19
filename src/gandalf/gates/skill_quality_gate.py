@@ -22,9 +22,8 @@ _TASK = (
 class QualityGateReviewGate:
     name = "quality_gate_review"
     blocking = True
+    uses_llm = True  # --no-llm drops the gate, not just the summary
     category = "Best practices"
 
     async def run(self, ctx: GateContext) -> GateResult:
-        return await skills.judge(
-            ctx, skill="quality-gate-review", gate_name=self.name, task=_TASK
-        )
+        return await skills.judge(ctx, skill="quality-gate-review", gate_name=self.name, task=_TASK)

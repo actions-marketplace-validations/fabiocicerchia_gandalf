@@ -7,9 +7,13 @@ no request/diff it degrades to WARN. Passes at >= 85% compliance.
 
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
 from gandalf.base import GateContext, GateOutcome, GateResult
+from gandalf.gates._toolchain import seq
 from gandalf.plugins import unavailable
-from gandalf.skills import _parse_json as _parse_judge
+from gandalf.skills import parse_json as parse_judge
 
 COMPLIANCE_THRESHOLD = 0.85
 _DIFF_LIMIT = 24_000
@@ -41,60 +45,56 @@ Respond with ONLY a JSON object, no prose, no markdown fences:
 """
 
 
+def _prompt(ctx: GateContext) -> str | None:
+    """The judge prompt for this change, or None when there is nothing to judge."""
+    meta = ctx.meta or {}
+    title = (meta.get("title") or "").strip()
+    body = (meta.get("body") or "").strip()
+    diff = (meta.get("diff") or "").strip()
+    if not diff or not (title or body):
+        return None
+    diff_trunc = diff[:_DIFF_LIMIT] + ("\n…[diff truncated]" if len(diff) > _DIFF_LIMIT else "")
+    body_trunc = body[:_BODY_LIMIT] + ("\n…[truncated]" if len(body) > _BODY_LIMIT else "")
+    return _PROMPT.format(title=title, body=body_trunc, diff=diff_trunc)
+
+
+def _verdict(gate: str, data: dict[str, Any]) -> GateResult:
+    """The judge's JSON as a gate result. A score that will not parse is 0 —
+    never a pass."""
+    try:
+        pct = max(0, min(100, round(float(data.get("compliance", 0)))))
+    except (TypeError, ValueError):
+        pct = 0
+    score = pct / 100.0
+    missing = [str(m).strip() for m in seq(data.get("missing")) if str(m).strip()]
+    outcome = GateOutcome.PASS if score >= COMPLIANCE_THRESHOLD else GateOutcome.FAIL
+    summary = f"{pct}% compliant" + (f" · {len(missing)} unmet point(s)" if missing else "")
+    findings = [{"missing": m} for m in missing]
+    if data.get("summary"):
+        findings.append({"judge_summary": str(data["summary"])})
+    return GateResult(gate, outcome, score, summary, findings)
+
+
 class ComplianceGate:
     name = "compliance"
     blocking = False
+    uses_llm = True  # --no-llm drops the gate, not just the summary
 
     async def run(self, ctx: GateContext) -> GateResult:
-        import asyncio
+        from gandalf import llm  # noqa: PLC0415 — local import: importing at module scope closes a cycle
 
-        from gandalf import llm
-
-        meta = ctx.meta or {}
-        title = (meta.get("title") or "").strip()
-        body = (meta.get("body") or "").strip()
-        diff = (meta.get("diff") or "").strip()
-        if not diff or not (title or body):
-            return unavailable(
-                self.name, "compliance: no request/diff to judge (pass --title/--body)"
-            )
-
-        diff_trunc = diff[:_DIFF_LIMIT] + (
-            "\n…[diff truncated]" if len(diff) > _DIFF_LIMIT else ""
-        )
-        body_trunc = body[:_BODY_LIMIT] + (
-            "\n…[truncated]" if len(body) > _BODY_LIMIT else ""
-        )
-        prompt = _PROMPT.format(title=title, body=body_trunc, diff=diff_trunc)
+        prompt = _prompt(ctx)
+        if prompt is None:
+            return unavailable(self.name, "compliance: no request/diff to judge (pass --title/--body)")
         try:
             # llm.chat is blocking (urllib) — run it off the event loop.
-            text = await asyncio.to_thread(
-                llm.chat, [{"role": "user", "content": prompt}], temperature=0.0
-            )
-            data = _parse_judge(text)
-        except Exception as exc:  # noqa: BLE001 — never crash the run on the judge
+            text = await asyncio.to_thread(llm.chat, [{"role": "user", "content": prompt}], temperature=0.0)
+            data = parse_judge(text)
+        except Exception as exc:
             return GateResult(
                 self.name,
                 GateOutcome.FAIL,
                 0.0,
                 f"compliance: judge unavailable ({str(exc)[:80]})",
             )
-
-        try:
-            pct = max(0, min(100, round(float(data.get("compliance", 0)))))
-        except (TypeError, ValueError):
-            pct = 0
-        score = pct / 100.0
-        missing = [
-            str(m).strip() for m in (data.get("missing") or []) if str(m).strip()
-        ]
-        outcome = (
-            GateOutcome.PASS if score >= COMPLIANCE_THRESHOLD else GateOutcome.FAIL
-        )
-        summary = f"{pct}% compliant" + (
-            f" · {len(missing)} unmet point(s)" if missing else ""
-        )
-        findings = [{"missing": m} for m in missing]
-        if data.get("summary"):
-            findings.append({"judge_summary": str(data["summary"])})
-        return GateResult(self.name, outcome, score, summary, findings)
+        return _verdict(self.name, data)

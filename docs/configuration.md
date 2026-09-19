@@ -63,6 +63,7 @@ wins over built-in defaults. All keys are optional.
 only        = ["ruff", "gitleaks"]   # allowlist: run ONLY these gates
 skip        = ["atheris"]            # denylist: never run these
 concurrency = 8                       # max gates running at once (<=0 = unbounded)
+deadline    = 540                     # wall-clock budget for the whole run (<=0 = none)
 exclude     = ["src/generated", "*.min.js"]  # paths no gate should read
 ```
 
@@ -70,6 +71,23 @@ exclude     = ["src/generated", "*.min.js"]  # paths no gate should read
 ~60 gates may each spawn a `docker run`, which can swamp a laptop or CI runner
 if they all launch at once. Precedence: `--concurrency N` → `GANDALF_CONCURRENCY`
 → config → CPU count.
+
+Because there is a queue, the order gates are submitted in decides when the run
+ends. Gandalf submits them **heaviest first**, estimating from what each gate
+cost the last time it ran (recorded in the `--cache` file) and falling back to a
+built-in prior — so the five-minute scanner starts immediately instead of last,
+and lowering `concurrency` costs much less than it looks like it should. A gate
+can declare its own estimate with a `cost` class attribute, in seconds; see
+[Performance](performance.md).
+
+`deadline` bounds the run as a whole, which a per-gate timeout cannot: one gate
+may make fifty tool calls, so "120s each" is not 120s. Past it, a tool call is
+not started — the gates that got their turn are reported, the rest are marked
+*did not run*, and the scan still produces a scorecard instead of being killed
+by whatever was waiting on it. Off by default: CI wants the whole answer and
+already has its own job timeout. The editor extension sets it from
+`gandalf.scan.timeoutSeconds`, a little under its own kill. Precedence:
+`--deadline N` → `GANDALF_DEADLINE` → config → none.
 
 ### Excluding paths
 

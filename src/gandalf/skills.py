@@ -23,20 +23,27 @@ import asyncio
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 from gandalf import llm
 from gandalf.base import GateContext, GateOutcome, GateResult
 from gandalf.plugins import unavailable
 
-# skills/ lives at the repo root, above the src/gandalf/ package.
-_SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
+# The skills ship inside the package, so they are there whether gandalf runs
+# from a checkout or from an installed wheel.
+_SKILLS_DIR = Path(__file__).resolve().parent / "assets"
 
 _DIFF_LIMIT = 12_000
 _FINDINGS_CAP = 12
 _FRONTMATTER = re.compile(r"^---\n.*?\n---\n", re.DOTALL)
 
 
-class SkillNotFound(Exception):
+# RAG bands for a skill score.
+GREEN_SCORE = 0.8
+AMBER_SCORE = 0.6
+
+
+class SkillNotFoundError(Exception):
     """The named skill has no SKILL.md under skills/ — a packaging error, not a
     runtime condition, so it's raised rather than degraded to WARN."""
 
@@ -45,11 +52,11 @@ def load_skill(name: str) -> str:
     """Return a skill's SKILL.md body with its YAML frontmatter stripped."""
     path = _SKILLS_DIR / name / "SKILL.md"
     if not path.is_file():
-        raise SkillNotFound(f"no skill playbook at {path}")
+        raise SkillNotFoundError(f"no skill playbook at {path}")
     return _FRONTMATTER.sub("", path.read_text(errors="replace")).strip()
 
 
-def _loads(s: str) -> dict:
+def _loads(s: str) -> dict[str, Any]:
     """json.loads, but input nested too deep for the C decoder surfaces as an
     ordinary parse error instead of leaking RecursionError to callers that only
     guard against JSONDecodeError."""
@@ -59,7 +66,7 @@ def _loads(s: str) -> dict:
         raise json.JSONDecodeError("input too deeply nested", s, 0) from exc
 
 
-def _parse_json(text: str) -> dict:
+def parse_json(text: str) -> dict[str, Any]:
     """Tolerant JSON extraction: strip markdown fences, else grab the first
     brace-delimited object. Raises json.JSONDecodeError on anything unparsable
     (including over-nested input). The compliance gate delegates here."""
@@ -96,9 +103,9 @@ def _coerce_outcome(raw: str, score: float) -> GateOutcome:
     hit = _OUTCOMES.get(str(raw).strip().lower())
     if hit is not None:
         return hit
-    if score >= 0.8:
+    if score >= GREEN_SCORE:
         return GateOutcome.PASS
-    if score >= 0.6:
+    if score >= AMBER_SCORE:
         return GateOutcome.WARN
     return GateOutcome.FAIL
 
@@ -141,16 +148,14 @@ async def judge(
         f"{playbook}\n\n---\n\n"
         + _INSTRUCTION.format(task=task, cap=_FINDINGS_CAP)
         + "\n"
-        + llm._context(ctx.workdir, label, diff[:_DIFF_LIMIT])
+        + llm.repo_context(ctx.workdir, label, diff[:_DIFF_LIMIT])
     )
 
     try:
         # llm.chat is blocking urllib — keep it off the event loop.
-        text = await asyncio.to_thread(
-            llm.chat, [{"role": "user", "content": prompt}], temperature=0.0
-        )
-        data = _parse_json(text)
-    except Exception as exc:  # noqa: BLE001 — the judge must never sink the run
+        text = await asyncio.to_thread(llm.chat, [{"role": "user", "content": prompt}], temperature=0.0)
+        data = parse_json(text)
+    except Exception as exc:
         return unavailable(
             gate_name,
             f"{gate_name}: skill judge unavailable ({str(exc)[:80]}) — skipped",
@@ -162,10 +167,7 @@ async def judge(
         pct = 0
     score = pct / 100.0
     outcome = _coerce_outcome(data.get("outcome", ""), score)
-    findings = [
-        {"finding": str(f).strip()}
-        for f in (data.get("findings") or [])
-        if str(f).strip()
-    ][:_FINDINGS_CAP]
+    raw: list[object] = data.get("findings") or []
+    findings = [{"finding": str(f).strip()} for f in raw if str(f).strip()][:_FINDINGS_CAP]
     summary = str(data.get("summary") or f"{pct}/100").strip()
     return GateResult(gate_name, outcome, score, summary, findings)

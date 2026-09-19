@@ -29,12 +29,22 @@ import sys
 import tempfile
 import time
 import tracemalloc
+from collections.abc import Callable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from gandalf import findings as gfindings  # noqa: E402
-from gandalf import plugins, scope  # noqa: E402
+# Imported after the sys.path tweak above, on purpose.
+from typing import Any
+
+from gandalf import findings as gfindings
+from gandalf import ignores, plugins, scope
+
+
+def _say(*parts: object) -> None:
+    """The benchmark's own output: its stdout is the interface."""
+    print(*parts)  # noqa: T201 — this function is this script's stdout
+
 
 # Big enough that the numbers mean something, small enough that `make bench`
 # stays a coffee-free operation.
@@ -45,7 +55,7 @@ REPO_FILES = 400
 REPEAT = 5
 
 
-def timed(fn, repeat: int = REPEAT) -> float:
+def timed(fn: Callable[[], object], repeat: int = REPEAT) -> float:
     """Milliseconds for the fastest of `repeat` runs.
 
     The fastest, not the mean: every source of noise on a developer machine
@@ -60,7 +70,7 @@ def timed(fn, repeat: int = REPEAT) -> float:
     return best * 1000
 
 
-def peak_mb(fn) -> float:
+def peak_mb(fn: Callable[[], object]) -> float:
     """Peak heap in MiB while `fn` runs."""
     tracemalloc.start()
     try:
@@ -73,13 +83,13 @@ def peak_mb(fn) -> float:
 # --- the subjects ------------------------------------------------------------
 
 
-def bench_tree_filter() -> dict:
+def bench_tree_filter() -> dict[str, Any]:
     """The exclusion filter, applied to every path in the tree on every scan."""
-    pats = plugins.ignore_patterns(".") + ("*.min.js", "src/generated", "vendor")
+    pats = (*plugins.ignore_patterns("."), "*.min.js", "src/generated", "vendor")
     paths = [f"src/pkg{i % 200}/mod{i}.py" for i in range(TREE_PATHS)]
-    plugins._compiled_ignores.cache_clear()
+    ignores.compiled_ignores.cache_clear()
 
-    def run():
+    def run() -> list[Any]:
         return [p for p in paths if not plugins.is_ignored(p, pats)]
 
     return {
@@ -90,7 +100,7 @@ def bench_tree_filter() -> dict:
     }
 
 
-def bench_content_hash(tmp: Path) -> dict:
+def bench_content_hash(tmp: Path) -> list[dict[str, Any]]:
     """The cache key: one hash over every scanned file's name and contents.
 
     `read_bytes()` pulled each file into memory whole; `file_digest` reads it in
@@ -107,7 +117,7 @@ def bench_content_hash(tmp: Path) -> dict:
     root = tmp / "hashtree"
     root.mkdir()
     small = b"x = 1\n" * 2_000  # ~12 KB, a plausible source file
-    files = []
+    files: list[str] = []
     for i in range(HASH_FILES):
         f = root / f"mod{i}.py"
         f.write_bytes(small)
@@ -116,14 +126,14 @@ def bench_content_hash(tmp: Path) -> dict:
     (root / "fixture.bin").write_bytes(b"\0" * (32 * 1024 * 1024))
     files.append("fixture.bin")
 
-    def old():
+    def old() -> str:
         h = hashlib.sha256()
         for f in sorted(files):
             h.update(f.encode())
             h.update(hashlib.sha256((root / f).read_bytes()).digest())
         return h.hexdigest()
 
-    def new():
+    def new() -> str:
         h = hashlib.sha256()
         for f in sorted(files):
             h.update(f.encode())
@@ -150,7 +160,7 @@ def bench_content_hash(tmp: Path) -> dict:
     ]
 
 
-def _payload(n: int) -> dict:
+def _payload(n: int) -> dict[str, Any]:
     """A run record the size of a first scan of a large untended repo."""
     per_gate = n // 40
     return {
@@ -179,7 +189,7 @@ def _payload(n: int) -> dict:
     }
 
 
-def bench_report_write(tmp: Path) -> dict:
+def bench_report_write(tmp: Path) -> dict[str, Any]:
     """Writing the JSON report.
 
     `write_text(json.dumps(...))` renders the whole document into a string and
@@ -190,10 +200,10 @@ def bench_report_write(tmp: Path) -> dict:
     payload = _payload(FINDINGS)
     out = tmp / "report.json"
 
-    def old():
+    def old() -> None:
         out.write_text(json.dumps(payload, indent=2, default=str))
 
-    def new():
+    def new() -> None:
         with out.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, default=str)
 
@@ -210,7 +220,7 @@ def bench_report_write(tmp: Path) -> dict:
     }
 
 
-def bench_annotate() -> dict:
+def bench_annotate() -> dict[str, Any]:
     """Reconciling every finding's path/line/rule — runs once per report."""
     raw = [g["findings"] for g in _payload(FINDINGS)["gates"]]
     flat = [f for gate in raw for f in gate]
@@ -223,7 +233,7 @@ def bench_annotate() -> dict:
     }
 
 
-def bench_languages(tmp: Path) -> dict:
+def bench_languages(tmp: Path) -> dict[str, Any]:
     """Detecting the languages in scope, on a whole-tree scan.
 
     The old implementation ran its own `git ls-files`; the gates then ran
@@ -246,14 +256,12 @@ def bench_languages(tmp: Path) -> dict:
     )
     root = str(repo)
 
-    def old():
+    def old() -> set[str]:
         # scope.languages as it was: its own listing, split on whitespace.
-        out = subprocess.run(
-            ["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True
-        ).stdout
-        return scope._classify(out.split())
+        out = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True).stdout
+        return scope.classify(out.split())
 
-    def new():
+    def new() -> set[str]:
         return scope.languages(root, [])
 
     plugins.tracked_files.cache_clear()
@@ -271,7 +279,7 @@ def bench_languages(tmp: Path) -> dict:
 # --- the extension half ------------------------------------------------------
 
 
-def bench_extension(repo_root: Path) -> list[dict]:
+def bench_extension(repo_root: Path) -> list[dict[str, Any]]:
     """Run the VS Code extension's bench, if node and its deps are here.
 
     Skipped rather than failed when they aren't: the Python half is useful on
@@ -279,31 +287,39 @@ def bench_extension(repo_root: Path) -> list[dict]:
     """
     ext = repo_root / "extensions" / "vscode"
     if not shutil.which("node") or not (ext / "node_modules").is_dir():
-        print("  (extension bench skipped — needs node and `npm install` in", ext, ")")
+        _say("  (extension bench skipped — needs node and `npm install` in", ext, ")")
         return []
     build = subprocess.run(
-        ["node", "esbuild.mjs", "--bench"], cwd=ext, capture_output=True, text=True
+        ["node", "esbuild.mjs", "--bench"],
+        cwd=ext,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if build.returncode != 0:
-        print("  (extension bench skipped — build failed)\n", build.stderr[-500:])
+        _say("  (extension bench skipped — build failed)\n", build.stderr[-500:])
         return []
     run = subprocess.run(
-        ["node", "out/bench.js"], cwd=ext, capture_output=True, text=True
+        ["node", "out/bench.js"],
+        cwd=ext,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if run.returncode != 0:
-        print("  (extension bench skipped — run failed)\n", run.stderr[-500:])
+        _say("  (extension bench skipped — run failed)\n", run.stderr[-500:])
         return []
     try:
         return json.loads(run.stdout)
     except json.JSONDecodeError:
-        print("  (extension bench skipped — unreadable output)")
+        _say("  (extension bench skipped — unreadable output)")
         return []
 
 
 # --- output ------------------------------------------------------------------
 
 
-def table(rows: list[dict]) -> str:
+def table(rows: list[dict[str, Any]]) -> str:
     width = max(len(r["label"]) for r in rows)
     out = [f"  {'':{width}}   {'before':>10}  {'after':>10}   change"]
     for r in rows:
@@ -313,37 +329,29 @@ def table(rows: list[dict]) -> str:
         b = f"{before:.1f}" if before is not None else "—"
         change = ""
         if before is not None and after > 0:
-            change = (
-                f"{before / after:.1f}x faster"
-                if "ms" in unit
-                else f"{before / after:.1f}x smaller"
-            )
-        out.append(
-            f"  {r['label']:{width}}   {b:>10}  {after:>10.1f}   {change}   ({unit})"
-        )
+            change = f"{before / after:.1f}x faster" if "ms" in unit else f"{before / after:.1f}x smaller"
+        out.append(f"  {r['label']:{width}}   {b:>10}  {after:>10.1f}   {change}   ({unit})")
     return "\n".join(out)
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="bench", description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(prog="bench", description=(__doc__ or "").split("\n")[0])
     ap.add_argument("--json", action="store_true", help="emit the raw measurements")
     ap.add_argument("--svg", metavar="PATH", help="write the chart here")
     ap.add_argument("--no-extension", action="store_true", help="skip the VS Code half")
     args = ap.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent
-    rows: list[dict] = []
+    rows: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="gandalf-bench-") as tmp:
         d = Path(tmp)
         if not args.json:
-            print(
-                f"gandalf bench — python {sys.version.split()[0]}, {os.cpu_count()} cpu\n"
-            )
+            _say(f"gandalf bench — python {sys.version.split()[0]}, {os.cpu_count()} cpu\n")
         for subject in (
-            lambda: bench_tree_filter(),
+            bench_tree_filter,
             lambda: bench_content_hash(d),
             lambda: bench_report_write(d),
-            lambda: bench_annotate(),
+            bench_annotate,
             lambda: bench_languages(d),
         ):
             produced = subject()
@@ -357,17 +365,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         json.dump(rows, sys.stdout, indent=2)
-        print()
+        _say()
         return 0
 
-    print(table(rows))
+    _say(table(rows))
     if args.svg:
-        from chart import render  # noqa: PLC0415 — only needed for --svg
+        # Local import: only needed for --svg.
+        from chart import render
 
         target = Path(args.svg)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(render(rows))
-        print(f"\n  chart: {target}")
+        _say(f"\n  chart: {target}")
     return 0
 
 

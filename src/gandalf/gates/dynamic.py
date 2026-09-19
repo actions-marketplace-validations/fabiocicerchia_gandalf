@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from gandalf.base import GateContext, GateOutcome, GateResult
+from gandalf.gates._toolchain import scored
 from gandalf.plugins import (
     communicate,
     unavailable,
@@ -24,14 +25,18 @@ _DEFAULT_FUZZ_TIME = 60
 _DAST_TIMEOUT = 300
 
 
+# A handful of real findings warns; beyond that the scan has failed.
+MAX_FINDINGS = 3
+
+
 def _is_local(url: str) -> bool:
     host = urlparse(url).hostname or ""
-    return host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")  # nosec B104 — host equality check, not a bind
+    # Compared against, never bound # nosec B104 — host equality check, not a bind
+    return host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")  # noqa: S104
 
 
-async def _run(
-    cmd: list[str], cwd: str, timeout: int = _DAST_TIMEOUT
-) -> tuple[int, str, str]:
+# The timeout is plumbed to asyncio.wait_for, which is the mechanism this rule asks for
+async def _run(cmd: list[str], cwd: str, timeout: int = _DAST_TIMEOUT) -> tuple[int, str, str]:  # noqa: ASYNC109
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -49,18 +54,40 @@ async def _run(
     )
 
 
-def _guard(ctx: GateContext, name: str):
-    """Return (target_url, None) or (None, skip_result)."""
-    target = (ctx.meta or {}).get("target", "")
+def _guard(ctx: GateContext, name: str) -> str | GateResult:
+    """The target URL to scan, or the result to return instead of scanning.
+
+    One value rather than a (target, skip) pair: the two were never both
+    meaningful, and reading the target out of the pair meant every caller had
+    to know that a non-None skip made it None.
+    """
+    target = str((ctx.meta or {}).get("target", ""))
     if not target:
-        return None, unavailable(
-            name, f"{name}: no target URL — skipped (pass --target)"
-        )
+        return unavailable(name, f"{name}: no target URL — skipped (pass --target)")
     if not _is_local(target) and not (ctx.meta or {}).get("allow_remote", False):
-        return None, unavailable(
-            name, f"{name}: refusing active scan against non-local target '{target}'"
-        )
-    return target, None
+        return unavailable(name, f"{name}: refusing active scan against non-local target '{target}'")
+    return target
+
+
+def _endpoint(ctx: GateContext, target: str) -> tuple[str, str]:
+    """(API base, bearer token) for an active scan against `target`."""
+    meta = ctx.meta or {}
+    return meta.get("api", target.rstrip("/") + "/api/v1"), meta.get("bearer", "")
+
+
+# nikto always reports these, on any server; they are not findings.
+_NIKTO_BANNER = ("Server:", "Retrieved", "Allowed HTTP")
+
+
+def _nikto_lines(out: str) -> tuple[list[str], list[str]]:
+    """(every `+ ` result line, the ones that are not nikto's standard banner)."""
+    found = [ln for ln in out.strip().splitlines() if ln.startswith("+ ")]
+    return found, [f for f in found if not any(k in f for k in _NIKTO_BANNER)]
+
+
+def _dalfox_vulns(text: str) -> list[str]:
+    """dalfox's confirmed-XSS lines."""
+    return [ln for ln in text.splitlines() if "[V]" in ln or "VULN" in ln.upper()]
 
 
 async def _atheris_installed(workdir: str) -> bool:
@@ -88,9 +115,7 @@ class AtherisGate:
     async def run(self, ctx: GateContext) -> GateResult:
         harness = Path(ctx.workdir) / "tests" / "fuzz" / "fuzz_adapters.py"
         if not harness.exists():
-            return unavailable(
-                self.name, "atheris: no fuzz harness at tests/fuzz/fuzz_adapters.py"
-            )
+            return unavailable(self.name, "atheris: no fuzz harness at tests/fuzz/fuzz_adapters.py")
         if not await _atheris_installed(ctx.workdir):
             return unavailable(self.name, "atheris: package not installed — skipped")
         fuzz_time = int((ctx.meta or {}).get("fuzz_time", _DEFAULT_FUZZ_TIME))
@@ -113,11 +138,7 @@ class AtherisGate:
         # self-match. A nonzero exit is the authoritative signal (libFuzzer
         # exits 0 after a clean time-budget run); the marker check is belt
         # and suspenders for when exit codes get lost through a wrapper.
-        if (
-            rc != 0
-            or "ERROR: libFuzzer" in combined
-            or "Uncaught Python exception" in combined
-        ):
+        if rc != 0 or "ERROR: libFuzzer" in combined or "Uncaught Python exception" in combined:
             return GateResult(
                 self.name,
                 GateOutcome.FAIL,
@@ -140,9 +161,9 @@ class NiktoGate:
     blocking = False
 
     async def run(self, ctx: GateContext) -> GateResult:
-        target, skip = _guard(ctx, self.name)
-        if skip:
-            return skip
+        target = _guard(ctx, self.name)
+        if isinstance(target, GateResult):
+            return target
         if not shutil.which("nikto"):
             return unavailable(self.name, "nikto not installed — skipped")
         rc, out, _ = await _run(
@@ -151,22 +172,15 @@ class NiktoGate:
         )
         if rc == -1:
             return unavailable(self.name, "nikto: timed out")
-        findings = [ln for ln in out.strip().splitlines() if ln.startswith("+ ")]
+        findings, real = _nikto_lines(out)
         if not findings:
             return GateResult(self.name, GateOutcome.PASS, 1.0, "nikto: no findings")
-        real = [
-            f
-            for f in findings
-            if not any(k in f for k in ("Server:", "Retrieved", "Allowed HTTP"))
-        ]
-        score = max(0.0, 1.0 - min(len(real), 10) / 10)
-        outcome = GateOutcome.WARN if len(real) <= 3 else GateOutcome.FAIL
-        return GateResult(
+        return scored(
             self.name,
-            outcome,
-            score,
+            len(real),
             f"nikto: {len(real)} issue(s)",
             [{"finding": f} for f in real],
+            fail=len(real) > MAX_FINDINGS,
         )
 
 
@@ -177,13 +191,12 @@ class SqlmapGate:
     blocking = False
 
     async def run(self, ctx: GateContext) -> GateResult:
-        target, skip = _guard(ctx, self.name)
-        if skip:
-            return skip
+        target = _guard(ctx, self.name)
+        if isinstance(target, GateResult):
+            return target
         if not shutil.which("sqlmap"):
             return unavailable(self.name, "sqlmap not installed — skipped")
-        api = (ctx.meta or {}).get("api", target.rstrip("/") + "/api/v1")
-        bearer = (ctx.meta or {}).get("bearer", "")
+        api, bearer = _endpoint(ctx, target)
         cmd = [
             "sqlmap",
             "-u",
@@ -212,9 +225,7 @@ class SqlmapGate:
                 "sqlmap: injectable parameter found",
                 [{"log": combined[-800:]}],
             )
-        return GateResult(
-            self.name, GateOutcome.PASS, 1.0, "sqlmap: no injection found"
-        )
+        return GateResult(self.name, GateOutcome.PASS, 1.0, "sqlmap: no injection found")
 
 
 class DalfoxGate:
@@ -224,13 +235,12 @@ class DalfoxGate:
     blocking = False
 
     async def run(self, ctx: GateContext) -> GateResult:
-        target, skip = _guard(ctx, self.name)
-        if skip:
-            return skip
+        target = _guard(ctx, self.name)
+        if isinstance(target, GateResult):
+            return target
         if not shutil.which("dalfox"):
             return unavailable(self.name, "dalfox not installed — skipped")
-        api = (ctx.meta or {}).get("api", target.rstrip("/") + "/api/v1")
-        bearer = (ctx.meta or {}).get("bearer", "")
+        api, bearer = _endpoint(ctx, target)
         cmd = [
             "dalfox",
             "url",
@@ -244,10 +254,7 @@ class DalfoxGate:
         rc, out, err = await _run(cmd, ctx.workdir)
         if rc == -1:
             return unavailable(self.name, "dalfox: timed out")
-        combined = out + err
-        vuln_lines = [
-            ln for ln in combined.splitlines() if "[V]" in ln or "VULN" in ln.upper()
-        ]
+        vuln_lines = _dalfox_vulns(out + err)
         if vuln_lines:
             return GateResult(
                 self.name,

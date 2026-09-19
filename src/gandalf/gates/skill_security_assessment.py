@@ -26,9 +26,8 @@ _TASK = (
 class SecurityAssessmentGate:
     name = "security_assessment"
     blocking = False
+    uses_llm = True  # --no-llm drops the gate, not just the summary
     category = "Security"
 
     async def run(self, ctx: GateContext) -> GateResult:
-        return await skills.judge(
-            ctx, skill="security-assessment", gate_name=self.name, task=_TASK
-        )
+        return await skills.judge(ctx, skill="security-assessment", gate_name=self.name, task=_TASK)

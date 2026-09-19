@@ -4,6 +4,45 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0](https://github.com/fabiocicerchia/gandalf/compare/v0.13.0...v0.14.0) (2026-09-16)
+
+
+### Features
+
+* **perf:** let a long scan end with a report instead of being killed ([#113](https://github.com/fabiocicerchia/gandalf/issues/113)) ([c6c984d](https://github.com/fabiocicerchia/gandalf/commit/c6c984d097676ce7564990b58ea9453298a39d78))
+
+## [0.13.0](https://github.com/fabiocicerchia/gandalf/compare/v0.12.4...v0.13.0) (2026-09-12)
+
+
+### Features
+
+* **perf:** schedule the heaviest gates first, and make a slow scan explain itself ([#110](https://github.com/fabiocicerchia/gandalf/issues/110)) ([b218b7d](https://github.com/fabiocicerchia/gandalf/commit/b218b7d1574d91c580045bf2096a131aa0423e2a))
+
+## [0.12.4](https://github.com/fabiocicerchia/gandalf/compare/v0.12.3...v0.12.4) (2026-09-11)
+
+
+### Bug Fixes
+
+* **release:** let the release PR carry a token that isn't GITHUB_TOKEN ([#108](https://github.com/fabiocicerchia/gandalf/issues/108)) ([67abec3](https://github.com/fabiocicerchia/gandalf/commit/67abec323b379cd4684dd646e2c60e2956bc327c))
+
+## [0.12.3](https://github.com/fabiocicerchia/gandalf/compare/v0.12.2...v0.12.3) (2026-09-10)
+
+
+### Bug Fixes
+
+* **publish:** sign the images this workflow pushes ([#104](https://github.com/fabiocicerchia/gandalf/issues/104)) ([8f33b7b](https://github.com/fabiocicerchia/gandalf/commit/8f33b7b3d0e74641e4f42d3ebe40502c0ec3fae5))
+* **release:** grant id-token on the job that calls the signing workflow ([#105](https://github.com/fabiocicerchia/gandalf/issues/105)) ([f3ba6f6](https://github.com/fabiocicerchia/gandalf/commit/f3ba6f6ea0a87af2328241567381b2eb31c7e15e))
+* **release:** hand the Docker Hub secrets to the called workflow ([#102](https://github.com/fabiocicerchia/gandalf/issues/102)) ([eb3b0f1](https://github.com/fabiocicerchia/gandalf/commit/eb3b0f1e1e9a1a5ab50e2005b6998aa5c81bc6d3))
+
+## [0.12.2](https://github.com/fabiocicerchia/gandalf/compare/v0.12.1...v0.12.2) (2026-09-09)
+
+
+### Bug Fixes
+
+* **ci:** pin the editorconfig-checker binary version ([#88](https://github.com/fabiocicerchia/gandalf/issues/88)) ([44ba771](https://github.com/fabiocicerchia/gandalf/commit/44ba7711135818aa99a11b74077030a1530f450f))
+* **cli:** keep stdout parseable under --json ([#97](https://github.com/fabiocicerchia/gandalf/issues/97)) ([1138858](https://github.com/fabiocicerchia/gandalf/commit/1138858b40063157fac8457c7206e99e5e5c6707))
+* **pr:** repair the review comments — missing suggestions, leaked paths, duplicate threads ([#99](https://github.com/fabiocicerchia/gandalf/issues/99)) ([2175893](https://github.com/fabiocicerchia/gandalf/commit/2175893381adc6c7d43f2a4e27f93d3d013fd7f7))
+
 ## [0.12.1](https://github.com/fabiocicerchia/gandalf/compare/v0.12.0...v0.12.1) (2026-08-30)
 
 

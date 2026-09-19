@@ -48,7 +48,7 @@ One pass over a scope, every gate against the same file set:
   discover ───────────────► every .py in gates/ exporting a Gate, plus anything
       │                      on GANDALF_GATES_PATH
       │
-      ▼  concurrently, bounded by --concurrency
+      ▼  concurrently, heaviest gate first, bounded by --concurrency
   ┌─ gate ─────────────────────────────────────────────────┐
   │  cache hit on the scope's content hash?  → reuse       │
   │  tool on PATH?               → run it                  │
@@ -77,7 +77,7 @@ More in [`docs/architecture.md`](docs/architecture.md).
 
 ## What it does
 
-- **Runs ~60 gates** across security, dependencies, code quality, complexity,
+- **Runs ~130 gates** across security, dependencies, code quality, complexity,
   documentation, build & tests, best practices and architecture. Caveat: most
   wrap a third-party scanner, so what actually runs depends on what is
   installed — see the status note above.
@@ -118,22 +118,24 @@ More in [`docs/architecture.md`](docs/architecture.md).
 ## Install a `gandalf` command
 
 ```bash
-make install                       # drops a wrapper in ~/.local/bin (on your PATH)
-make install BINDIR=/usr/local/bin # …or anywhere else
+pipx install git+https://github.com/fabiocicerchia/gandalf@v0.12.1
 ```
 
-Or the one-line installer (clones/updates a checkout under
-`~/.local/share/gandalf` and runs `make install`):
+One command, and nothing is piped into a shell: pipx fetches over TLS, builds
+the wheel and installs the `gandalf` entry point. Pin the tag you want — drop
+`@v0.12.1` to track `main`, or `pipx upgrade gandalf` later.
+
+`pip install --user git+https://…` works the same way if you would rather not
+use pipx. There are no third-party dependencies, so either pulls in nothing
+else: gandalf drives the tools it finds on `PATH` and otherwise uses only the
+standard library. The skills the gates read ship inside the package, so an
+installed gandalf needs no checkout.
+
+Working on gandalf itself? Install the checkout instead, so edits take effect
+without reinstalling:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/fabiocicerchia/gandalf/main/install.sh | bash
-```
-
-Pure-stdlib, so the "install" is just a one-line wrapper that runs this checkout
-(`python -m gandalf`) against whatever repo you're in. Equivalent one-liner:
-
-```bash
-printf '#!/bin/sh\nexport PYTHONPATH="%s/src:$PYTHONPATH"\nexec python3 -m gandalf "$@"\n' "$PWD" > ~/.local/bin/gandalf && chmod +x ~/.local/bin/gandalf
+pipx install --editable .   # or: make install
 ```
 
 ### `.gandalfignore` — paths no gate should read
@@ -169,7 +171,8 @@ usage: gandalf [-h] [--commit SHA | --staged] [--path DIR] [--no-html]
                [--fix] [--target TARGET] [--allow-remote] [--title TITLE]
                [--body BODY] [--config PATH] [--exclude GLOB]
                [--fail-on {fail,warn}] [--min-score N] [--concurrency N]
-               [--severity-weight] [--baseline PATH] [--write-baseline [PATH]]
+               [--deadline SECONDS] [--severity-weight] [--baseline PATH]
+               [--write-baseline [PATH]] [--explain-score] [--tool-versions]
                [--cache [PATH]]
 
 gandalf CLI — evaluate the codebase, run pluggable gates, show RAG traffic lights.
@@ -226,8 +229,9 @@ variables that override it, are in
 ```toml
 [gandalf]
 skip        = ["atheris"]                    # never run these
-concurrency = 8                              # ~60 gates each able to spawn a
+concurrency = 8                              # ~130 gates each able to spawn a
                                              # docker run: bound them
+deadline    = 540                            # and bound the run as a whole
 exclude     = ["src/generated", "*.min.js"]  # paths no gate should read
 
 [gandalf.verdict]
@@ -286,7 +290,16 @@ where it can be reviewed.
 **`skill judge unavailable (<urlopen error [Errno 111] Connection refused>)`**
 The LLM-backed gates and the summary talk to an OpenAI-compatible endpoint at
 `GANDALF_LLM_URL`. With nothing listening they degrade to amber and the run
-continues; `--no-llm` skips them outright.
+continues; `--no-llm` skips them outright, which is also the biggest saving
+available to an editor or pre-commit run — each one costs a connect timeout and
+its retries before it can report that amber.
+
+**A scan that takes minutes, or never finishes.**
+`gandalf --debug` (or `GANDALF_DEBUG=1`) narrates the run on stderr with every
+line stamped with the elapsed time: each stage, the order gates were scheduled
+in, each gate's start and duration, and every external command. A gate with a
+`start` and no completion is the one you are waiting on.
+[Performance](docs/performance.md) has the rest of the levers.
 
 **`No module named gandalf`**
 The package lives under `src/`, so it needs `PYTHONPATH=src` — or `make

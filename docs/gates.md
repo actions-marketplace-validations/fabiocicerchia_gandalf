@@ -54,7 +54,7 @@ Select gates per repo in `.gandalf.toml`: `only = [...]` (allowlist),
 
 | Gate | Checks | Notes |
 |------|--------|-------|
-| `licenses` | Forbidden / restricted dependency licenses (via trivy). | Permissive licenses ignored. |
+| `licenses` | Forbidden / restricted dependency licenses. | Reads the licences out of the `trivy` gate's scan rather than walking the tree again; permissive licenses ignored. |
 
 ## Infrastructure — IaC, containers, CI config
 
@@ -149,10 +149,15 @@ none, and C/C++ has no standard package manager — so for those two the generic
 
 ## Skill-backed advisory gates
 
-These turn a prose reviewing **skill** (an embedded `skills/<slug>/SKILL.md`
+These turn a prose reviewing **skill** (an embedded `src/gandalf/assets/<slug>/SKILL.md`
 playbook) into an LLM-judged gate. They are **advisory** (PASS/WARN only) and
 degrade to WARN when the model is unreachable or the skill isn't embedded. The
 skill file is the rubric — edit it and the gate follows.
+
+Each costs a full model round trip, so `--no-llm` skips them outright (along
+with `compliance` and the report's summary) rather than running them and
+reporting amber; they are listed as disabled in the report. That is usually the
+largest saving available to an editor or pre-commit run.
 
 | Gate | Skill | Judges |
 |------|-------|--------|
@@ -164,7 +169,7 @@ skill file is the rubric — edit it and the gate follows.
 | `grill_me` | `grill-me` (+ `grilling`) | Design readiness — interrogates every branch of a decision. |
 | `well_architected` | `well-architected` | The change against the six Well-Architected pillars. |
 
-> Skills live at the repo root under `skills/`, read from gandalf's **own**
+> Skills ship inside the package under `src/gandalf/assets/`, read from gandalf's **own**
 > source tree (not the code under review), so `--commit`/`--staged` runs against
 > a throwaway worktree still find them. A missing skill directory makes the
 > strict skill gates error and the soft ones skip.
@@ -184,6 +189,7 @@ trust boundary, see
 ```python
 # gandalf/gates/mygate.py
 from gandalf.base import GateContext, GateOutcome, GateResult
+
 
 class MyGate:
     name = "mygate"
@@ -277,7 +283,7 @@ Cross-language SAST / deps / secrets / IaC:
 | `gitleaks` | yes | gitleaks | secrets in the tree |
 | `osv` | no | pip-audit | Python dependency vulns |
 | `osv_scanner` | no | osv-scanner | dependency vulns, **all ecosystems** (go.mod, package-lock, …) |
-| `trivy` | no | trivy | fs vulns + secrets + **misconfig + license** |
+| `trivy` | no | trivy | fs vulns + secrets + **misconfig + license** — the run's one `trivy fs`, which `licenses` reads too |
 | `checkov` | no | checkov | IaC misconfig |
 | `kics` | no | checkmarx/kics (own image) | IaC misconfig (Terraform/k8s/Docker/Ansible/…) |
 | `hadolint` | no | hadolint | Dockerfile lint |
@@ -384,7 +390,7 @@ you pass `--allow-remote`. `golangci-lint`/`govulncheck` aren't in the image
 ### Skill-driven review gates (4)
 
 These gates have no external tool. Each wraps one reviewing **skill** — a prose
-playbook under the repo's top-level [`skills/`](../skills) directory — and runs
+playbook under [`src/gandalf/assets/`](../src/gandalf/assets) — and runs
 it as an LLM judge against the same headroom endpoint the `compliance` gate uses.
 The skill's `SKILL.md` becomes the rubric; the model returns a strict JSON
 verdict (`outcome` + `score` + `findings`) that maps onto the gate. The skills
@@ -395,22 +401,24 @@ model.
 
 | Gate | Blocking | Skill | Judges |
 |------|----------|-------|--------|
-| `quality_gate_review` | yes | [`quality-gate-review`](../skills/quality-gate-review) | six weighted quality gates → GO / REVIEW / NO-GO (pass / warn / fail) |
-| `ruthless_refactor` | no | [`ruthless-refactor`](../skills/ruthless-refactor) | simplification wins: duplication, dead code, needless indirection, custom-vs-library |
-| `pr_code_summary` | no | [`pr-code-summarizer`](../skills/pr-code-summarizer) | a technical-lead's 60-second read; warns when complexity/risk is high |
-| `security_assessment` | no | [`security-assessment`](../skills/security-assessment) | CNCF TAG Security posture: SBOM, signing, branch protection, disclosure, incident response |
+| `quality_gate_review` | yes | [`quality-gate-review`](../src/gandalf/assets/quality-gate-review) | six weighted quality gates → GO / REVIEW / NO-GO (pass / warn / fail) |
+| `ruthless_refactor` | no | [`ruthless-refactor`](../src/gandalf/assets/ruthless-refactor) | simplification wins: duplication, dead code, needless indirection, custom-vs-library |
+| `pr_code_summary` | no | [`pr-code-summarizer`](../src/gandalf/assets/pr-code-summarizer) | a technical-lead's 60-second read; warns when complexity/risk is high |
+| `security_assessment` | no | [`security-assessment`](../src/gandalf/assets/security-assessment) | CNCF TAG Security posture: SBOM, signing, branch protection, disclosure, incident response |
 
 `quality_gate_review` is the only blocking skill gate — a NO-GO verdict reddens
 the run — but a WARN from an unreachable model never does. The skills are read
 from gandalf's own source tree (next to the package), not the worktree under
 review, so `--commit`/`--staged` runs judge against the same rubric. To disable
-these gates for a fast, LLM-free run, point `GANDALF_LLM_URL` at nothing (they
-WARN and drop out of the verdict) — the tool-based gates are unaffected.
+these gates for a fast, LLM-free run, pass `--no-llm` — they are not run at all,
+and the tool-based gates are unaffected. Pointing `GANDALF_LLM_URL` at nothing
+also works but is slower and noisier: each gate still spends a connect timeout
+and its retries before WARNing its way out of the verdict.
 
 ### Skill-backed advisory gates (3)
 
 A second family of skill gates, built on the shared `SkillGate` base in
-`gandalf/skillgate.py`. Each embeds a skill (under `skills/`) verbatim, wraps its
+`gandalf/skillgate.py`. Each embeds a skill (under `src/gandalf/assets/`) verbatim, wraps its
 `SKILL.md` in a non-interactive scoring contract, and maps the model's 0–100
 score to RAG. The skill file is the rubric and single source of truth — edit the
 skill and the gate follows, exactly like a human running `/<skill>`.
@@ -424,9 +432,9 @@ on every change).
 
 | Gate | Category | Embedded skill(s) | Judges |
 |------|----------|-------------------|--------|
-| `grill_me` | Design readiness | [`grill-me`](../skills/grill-me) → `grilling` | The load-bearing decisions the change leaves unresolved or ambiguous (PASS ≥ 80). |
-| `codebase_architecture` | Architecture | [`improve-codebase-architecture`](../skills/improve-codebase-architecture) → `codebase-design` | Deep-module health — shallow modules, poor locality, leaky seams, hard-to-test interfaces (PASS ≥ 75). |
-| `well_architected` | Well-Architected | [`well-architected`](../skills/well-architected) | The change against all six Well-Architected pillars, HRIs/MRIs tagged by severity (PASS ≥ 75). |
+| `grill_me` | Design readiness | [`grill-me`](../src/gandalf/assets/grill-me) → `grilling` | The load-bearing decisions the change leaves unresolved or ambiguous (PASS ≥ 80). |
+| `codebase_architecture` | Architecture | [`improve-codebase-architecture`](../src/gandalf/assets/improve-codebase-architecture) → `codebase-design` | Deep-module health — shallow modules, poor locality, leaky seams, hard-to-test interfaces (PASS ≥ 75). |
+| `well_architected` | Well-Architected | [`well-architected`](../src/gandalf/assets/well-architected) | The change against all six Well-Architected pillars, HRIs/MRIs tagged by severity (PASS ≥ 75). |
 
 `grill-me` and `improve-codebase-architecture` come from
 [mattpocock/skills](https://github.com/mattpocock/skills); `well-architected` is

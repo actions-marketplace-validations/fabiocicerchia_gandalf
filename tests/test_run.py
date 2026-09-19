@@ -6,29 +6,32 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import time
+from pathlib import Path
 
-from gandalf import plugins
+import pytest
+
+from gandalf import plugins, schedule
 from gandalf.__main__ import (
-    _files_note,
+    _drop_llm_gates,
     _gate_timeout,
     _resolve_concurrency,
-    _run_fixers,
+    _resolve_deadline,
     _run_gates,
-    _touched,
-    _tree_state,
     main,
 )
 from gandalf.base import GateContext, GateOutcome, GateResult
 from gandalf.config import Config
+from gandalf.fixers import _files_note, _touched, _tree_state, run_fixers
 
 
 class _Slow:
-    def __init__(self, name, tracker):
+    def __init__(self, name: str, tracker: dict[str, int]) -> None:
         self.name = name
         self.blocking = False
         self._t = tracker
 
-    async def run(self, ctx):
+    async def run(self, ctx: GateContext) -> GateResult:
         self._t["live"] += 1
         self._t["peak"] = max(self._t["peak"], self._t["live"])
         await asyncio.sleep(0.02)
@@ -40,37 +43,39 @@ class _Broken:
     name = "broken"
     blocking = False
 
-    async def run(self, ctx):
+    async def run(self, ctx: GateContext) -> GateResult:
         raise RuntimeError("boom")
 
 
 _CTX = GateContext(repo=".", workdir=".")
 
 
-def test_concurrency_is_bounded():
+def test_concurrency_is_bounded() -> None:
     t = {"live": 0, "peak": 0}
     gates = [_Slow(f"g{i}", t) for i in range(10)]
     res = asyncio.run(_run_gates(gates, _CTX, limit=3))
-    assert len(res) == 10 and t["peak"] == 3
+    assert len(res) == 10
+    assert t["peak"] == 3
 
 
-def test_unbounded_runs_all_at_once():
+def test_unbounded_runs_all_at_once() -> None:
     t = {"live": 0, "peak": 0}
     gates = [_Slow(f"g{i}", t) for i in range(6)]
     asyncio.run(_run_gates(gates, _CTX, limit=0))
     assert t["peak"] == 6
 
 
-def test_broken_gate_degrades_to_warn():
+def test_broken_gate_degrades_to_warn() -> None:
     res = asyncio.run(_run_gates([_Broken()], _CTX, limit=1))
-    assert res[0].outcome is GateOutcome.WARN and "boom" in res[0].summary
+    assert res[0].outcome is GateOutcome.WARN
+    assert "boom" in res[0].summary
 
 
 class _Fixer:
     name = "fixme"
     blocking = False
 
-    async def fix(self, ctx):
+    async def fix(self, ctx: GateContext) -> tuple[bool, str]:
         return (True, "did a thing")
 
 
@@ -78,7 +83,7 @@ class _NoFix:
     name = "nofix"
     blocking = False
 
-    async def run(self, ctx):
+    async def run(self, ctx: GateContext) -> GateResult:
         return GateResult(self.name, GateOutcome.PASS, 1.0, "ok")
 
 
@@ -86,32 +91,32 @@ class _BadFixer:
     name = "badfix"
     blocking = False
 
-    async def fix(self, ctx):
+    async def fix(self, ctx: GateContext) -> tuple[bool, str]:
         raise RuntimeError("nope")
 
 
-def test_run_fixers_collects_and_skips():
-    res = asyncio.run(_run_fixers([_Fixer(), _NoFix()], _CTX))
+def test_run_fixers_collects_and_skips() -> None:
+    res = asyncio.run(run_fixers([_Fixer(), _NoFix()], _CTX))
     # only the gate exposing fix() is run
     assert res == [("fixme", True, "did a thing")]
 
 
-def test_run_fixers_isolates_errors():
-    res = asyncio.run(_run_fixers([_BadFixer()], _CTX))
-    assert res[0][0] == "badfix" and res[0][1] is False and "nope" in res[0][2]
+def test_run_fixers_isolates_errors() -> None:
+    res = asyncio.run(run_fixers([_BadFixer()], _CTX))
+    assert res[0][0] == "badfix"
+    assert res[0][1] is False
+    assert "nope" in res[0][2]
 
 
-def test_resolve_concurrency_precedence(monkeypatch):
+def test_resolve_concurrency_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GANDALF_CONCURRENCY", raising=False)
     assert _resolve_concurrency(5, Config()) == 5  # cli wins
     assert _resolve_concurrency(None, Config({"concurrency": 7})) == 7  # then config
     monkeypatch.setenv("GANDALF_CONCURRENCY", "4")
-    assert (
-        _resolve_concurrency(None, Config({"concurrency": 7})) == 4
-    )  # env beats config
+    assert _resolve_concurrency(None, Config({"concurrency": 7})) == 4  # env beats config
 
 
-def test_gate_timeout_resolution():
+def test_gate_timeout_resolution() -> None:
     ts = {"default": 60, "semgrep": 300}
     assert _gate_timeout("semgrep", ts) == 300  # per-gate key wins
     assert _gate_timeout("ruff", ts) == 60  # falls to default
@@ -119,22 +124,20 @@ def test_gate_timeout_resolution():
     assert _gate_timeout("x", {"x": "abc"}) is None  # junk ignored
 
 
-def test_per_gate_timeout_visible_in_run():
-    seen = {}
+def test_per_gate_timeout_visible_in_run() -> None:
+    seen: dict[str, int | None] = {}
 
     class _Probe:
-        def __init__(self, n):
+        def __init__(self, n: str) -> None:
             self.name = n
             self.blocking = False
 
-        async def run(self, ctx):
+        async def run(self, ctx: GateContext) -> GateResult:
             seen[self.name] = plugins.GATE_TIMEOUT.get()
             return GateResult(self.name, GateOutcome.PASS, 1.0, "ok")
 
     ts = {"default": 60, "semgrep": 300}
-    asyncio.run(
-        _run_gates([_Probe("semgrep"), _Probe("ruff")], _CTX, limit=2, timeouts=ts)
-    )
+    asyncio.run(_run_gates([_Probe("semgrep"), _Probe("ruff")], _CTX, limit=2, timeouts=ts))
     assert seen == {"semgrep": 300, "ruff": 60}
 
 
@@ -150,7 +153,6 @@ if __name__ == "__main__":
     test_gate_timeout_resolution()
     test_per_gate_timeout_visible_in_run()
     assert _resolve_concurrency(5, Config()) == 5
-    print("ok")
 
 
 # --- report destinations: --out-dir / --no-trend --------------------------------
@@ -158,7 +160,7 @@ if __name__ == "__main__":
 # the run stays stdlib-fast (the build gate just compiles the Python in scope).
 
 
-def _git(repo, *args):
+def _git(repo: Path, *args: str) -> None:
     subprocess.run(
         ["git", "-c", "user.email=t@example.com", "-c", "user.name=test", *args],
         cwd=repo,
@@ -166,7 +168,7 @@ def _git(repo, *args):
     )
 
 
-def _mkrepo(tmp_path):
+def _mkrepo(tmp_path: Path):
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
     (repo / "src" / "ok.py").write_text("VALUE = 1\n")
@@ -177,7 +179,9 @@ def _mkrepo(tmp_path):
     return repo
 
 
-def test_out_dir_and_no_trend_keep_the_worktree_clean(tmp_path, monkeypatch, capsys):
+def test_out_dir_and_no_trend_keep_the_worktree_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     repo = _mkrepo(tmp_path)
     monkeypatch.chdir(repo)
     out = tmp_path / "artifacts" / "nested"  # missing parents must be created
@@ -191,7 +195,7 @@ def test_out_dir_and_no_trend_keep_the_worktree_clean(tmp_path, monkeypatch, cap
     assert str(out) in capsys.readouterr().out
 
 
-def test_reports_default_to_the_repo_and_record_a_trend(tmp_path, monkeypatch):
+def test_reports_default_to_the_repo_and_record_a_trend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo = _mkrepo(tmp_path)
     monkeypatch.chdir(repo)
 
@@ -202,7 +206,9 @@ def test_reports_default_to_the_repo_and_record_a_trend(tmp_path, monkeypatch):
     assert trend["score"] == 100
 
 
-def test_stream_emits_one_ndjson_line_per_gate(tmp_path, monkeypatch, capsys):
+def test_stream_emits_one_ndjson_line_per_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     repo = _mkrepo(tmp_path)
     monkeypatch.chdir(repo)
     out = tmp_path / "artifacts"
@@ -210,11 +216,7 @@ def test_stream_emits_one_ndjson_line_per_gate(tmp_path, monkeypatch, capsys):
     args = ["--no-llm", "--no-trend", "--no-html", "--stream", "--out-dir", str(out)]
     assert main(args) == 0
 
-    events = [
-        json.loads(line)
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith('{"event"')
-    ]
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{"event"')]
     assert events[0] == {"event": "start", "scope": "working-tree", "gates": 1}
     (gate,) = events[1:]
     assert gate["event"] == "gate"
@@ -226,7 +228,9 @@ def test_stream_emits_one_ndjson_line_per_gate(tmp_path, monkeypatch, capsys):
     assert isinstance(gate["duration"], float)
 
 
-def test_stream_reports_cache_hits_too(tmp_path, monkeypatch, capsys):
+def test_stream_reports_cache_hits_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     """A cached gate never runs, so nothing would report it — but a consumer's
     pane must still fill on a warm cache."""
     repo = _mkrepo(tmp_path)
@@ -238,16 +242,14 @@ def test_stream_reports_cache_hits_too(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     assert main([*args, "--stream"]) == 0
 
-    events = [
-        json.loads(line)
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith('{"event"')
-    ]
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{"event"')]
     assert [e["event"] for e in events] == ["start", "gate"]
     assert events[1]["name"] == "build"
 
 
-def test_stream_applies_baseline_suppression(tmp_path, monkeypatch, capsys):
+def test_stream_applies_baseline_suppression(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     """A baselined finding must not flash up in a consumer's pane and then
     vanish when the report lands."""
     repo = _mkrepo(tmp_path)
@@ -260,9 +262,7 @@ def test_stream_applies_baseline_suppression(tmp_path, monkeypatch, capsys):
     # Red, and the finding streams through.
     assert main([*common, "--stream"]) == 1
     streamed = [
-        json.loads(line)
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith('{"event": "gate"')
+        json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{"event": "gate"')
     ]
     assert len(streamed[0]["findings"]) == 1
 
@@ -271,15 +271,15 @@ def test_stream_applies_baseline_suppression(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     assert main([*common, "--stream"]) == 0
     streamed = [
-        json.loads(line)
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith('{"event": "gate"')
+        json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{"event": "gate"')
     ]
     assert streamed[0]["findings"] == []
     assert streamed[0]["outcome"] == "pass"
 
 
-def test_exclude_narrows_the_scan_end_to_end(tmp_path, monkeypatch, capsys):
+def test_exclude_narrows_the_scan_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     repo = _mkrepo(tmp_path)
     (repo / "src" / "generated").mkdir()
     (repo / "src" / "generated" / "broken.py").write_text("def oops(:\n")
@@ -291,29 +291,25 @@ def test_exclude_narrows_the_scan_end_to_end(tmp_path, monkeypatch, capsys):
     # The generated file does not compile, so the build gate fails on it.
     assert main([*args]) == 1
     gate = next(
-        json.loads(line)
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith('{"event": "gate"')
+        json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{"event": "gate"')
     )
     assert [f["path"] for f in gate["findings"]] == ["src/generated/broken.py"]
 
     # Excluded, the gate never reads it — and the run goes green.
     assert main([*args, "--exclude", "src/generated"]) == 0
     gate = next(
-        json.loads(line)
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith('{"event": "gate"')
+        json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{"event": "gate"')
     )
     assert gate["findings"] == []
 
 
-def test_exclude_can_come_from_the_config_file(tmp_path, monkeypatch, capsys):
+def test_exclude_can_come_from_the_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     repo = _mkrepo(tmp_path)
     (repo / "vendor").mkdir()
     (repo / "vendor" / "broken.py").write_text("def oops(:\n")
-    (repo / ".gandalf.toml").write_text(
-        '[gandalf]\nonly = ["build"]\nexclude = ["vendor"]\n'
-    )
+    (repo / ".gandalf.toml").write_text('[gandalf]\nonly = ["build"]\nexclude = ["vendor"]\n')
     _git(repo, "add", "-A")
     monkeypatch.chdir(repo)
 
@@ -322,7 +318,7 @@ def test_exclude_can_come_from_the_config_file(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
 
 
-def test_payload_gates_carry_their_category(tmp_path, monkeypatch):
+def test_payload_gates_carry_their_category(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo = _mkrepo(tmp_path)
     monkeypatch.chdir(repo)
     out = tmp_path / "artifacts"
@@ -333,29 +329,59 @@ def test_payload_gates_carry_their_category(tmp_path, monkeypatch):
     assert [g["category"] for g in payload["gates"]] == ["Build & tests"]
 
 
+def test_json_leaves_only_the_payload_on_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--json is for piping: a scorecard on stdout makes it unparsable."""
+    repo = _mkrepo(tmp_path)
+    monkeypatch.chdir(repo)
+    out = tmp_path / "artifacts"
+
+    args = ["--no-llm", "--no-trend", "--no-html", "--out-dir", str(out), "--json"]
+    assert main([*args]) == 0
+
+    cap = capsys.readouterr()
+    assert json.loads(cap.out)["verdict"] == "pass"  # stdout parses whole
+    assert "JSON report:" in cap.err  # the human lines moved aside
+
+
+def test_without_json_the_scorecard_stays_on_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The diversion is --json's alone — and must not leak into the next run."""
+    repo = _mkrepo(tmp_path)
+    monkeypatch.chdir(repo)
+    out = tmp_path / "artifacts"
+
+    assert main(["--no-llm", "--no-trend", "--no-html", "--out-dir", str(out)]) == 0
+
+    assert "JSON report:" in capsys.readouterr().out
+
+
 # --- --fix: what a fixer actually changed ---------------------------------------
 # A fixer's own account of its work is whatever its tool prints, and several of
 # them print nothing useful (eslint) or exit non-zero on a successful run. The
 # runner measures the worktree instead — these cover that measurement.
 
 
-def test_files_note_lists_and_truncates():
+def test_files_note_lists_and_truncates() -> None:
     assert _files_note(["a.py", "b.py"]) == "a.py, b.py"
     note = _files_note([f"f{i}.py" for i in range(7)])
-    assert note.startswith("f0.py, ") and note.endswith("…+2 more")
+    assert note.startswith("f0.py, ")
+    assert note.endswith("…+2 more")
 
 
-def test_touched_spots_content_changes_not_just_new_files():
+def test_touched_spots_content_changes_not_just_new_files() -> None:
     before = {"a.py": "h1", "b.py": "same"}
     after = {"a.py": "h2", "b.py": "same", "c.py": "new"}
     assert _touched(before, after) == ["a.py", "c.py"]
 
 
-def test_tree_state_outside_a_repo_is_silent(tmp_path):
+def test_tree_state_outside_a_repo_is_silent(tmp_path: Path) -> None:
     assert _tree_state(str(tmp_path)) == {}
 
 
-def test_fixer_report_comes_from_the_worktree(tmp_path):
+def test_fixer_report_comes_from_the_worktree(tmp_path: Path) -> None:
     """The fixer under-reports (says it changed nothing); the runner corrects it
     from the diff, which is what `eslint --fix` and `golangci-lint --fix` need."""
     repo = _mkrepo(tmp_path)
@@ -364,29 +390,128 @@ def test_fixer_report_comes_from_the_worktree(tmp_path):
         name = "rewriter"
         blocking = False
 
-        async def fix(self, ctx):
+        async def fix(self, ctx: GateContext) -> tuple[bool, str]:
             path = repo / "src" / "ok.py"
             path.write_text(path.read_text().replace("VALUE = 1", "VALUE = 2"))
             return (False, "rewriter ran")
 
-    (name, changed, msg) = asyncio.run(
-        _run_fixers([_Rewriter()], GateContext(repo=str(repo), workdir=str(repo)))
-    )[0]
+    (name, changed, msg) = asyncio.run(run_fixers([_Rewriter()], GateContext(repo=str(repo), workdir=str(repo))))[0]
     assert (name, changed) == ("rewriter", True)
     assert msg == "rewriter ran — src/ok.py"
 
 
-def test_a_fixer_that_changes_nothing_is_reported_as_such(tmp_path):
+def test_a_fixer_that_changes_nothing_is_reported_as_such(tmp_path: Path) -> None:
     repo = _mkrepo(tmp_path)
 
     class _Idle:
         name = "idle"
         blocking = False
 
-        async def fix(self, ctx):
+        async def fix(self, ctx: GateContext) -> tuple[bool, str]:
             return (False, "nothing to do")
 
-    res = asyncio.run(
-        _run_fixers([_Idle()], GateContext(repo=str(repo), workdir=str(repo)))
-    )
+    res = asyncio.run(run_fixers([_Idle()], GateContext(repo=str(repo), workdir=str(repo))))
     assert res == [("idle", False, "nothing to do")]
+
+
+class _Judge:
+    name = "grill_me"
+    blocking = False
+    uses_llm = True
+
+    async def run(self, ctx: GateContext) -> GateResult:
+        raise AssertionError("an LLM gate must not run under --no-llm")
+
+
+def test_no_llm_drops_the_llm_backed_gates() -> None:
+    """--no-llm means no LLM, not "no LLM summary". Each judge gate is a full
+    round trip, and a connect timeout plus its retries when nothing is
+    listening — minutes per scan, for an amber that says nothing about the
+    code. The README always documented it this way."""
+    kept, dropped = _drop_llm_gates([_Judge(), _NoFix()])
+    assert [g.name for g in kept] == ["nofix"]
+    assert dropped == ["grill_me"]
+
+
+def test_a_gate_without_the_marker_is_kept() -> None:
+    """`uses_llm` is opt-in, so a third-party gate is never dropped by guess."""
+    kept, dropped = _drop_llm_gates([_NoFix()])
+    assert len(kept) == 1
+    assert dropped == []
+
+
+class _Timed:
+    """Sleeps for `secs` once it is actually allowed to start."""
+
+    blocking = False
+
+    def __init__(self, name: str, secs: float) -> None:
+        self.name = name
+        self.secs = secs
+
+    async def run(self, ctx: GateContext) -> GateResult:
+        await asyncio.sleep(self.secs)
+        return GateResult(self.name, GateOutcome.PASS, 1.0, "ok")
+
+
+def test_the_recorded_duration_excludes_the_wait_for_a_slot() -> None:
+    """The scheduler reads these back, so a queue wait counted as duration is
+    self-reinforcing: one run behind a slow gate would promote a trivial gate
+    above it, and then keep it there. Measured from the moment it starts."""
+    gates = [_Timed("slow", 0.30), _Timed("quick", 0.01)]
+    results = asyncio.run(_run_gates(gates, _CTX, limit=1))
+    took = {r.name: plugins.meta(r, "duration") for r in results}
+    assert took["quick"] < 0.15, f"quick recorded its queue wait: {took}"
+    # ...so the next run still puts the genuinely slow gate first.
+    assert [g.name for g in schedule.order(gates, took)] == ["slow", "quick"]
+
+
+def test_resolve_deadline_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GANDALF_DEADLINE", raising=False)
+    assert _resolve_deadline(None, Config()) == 0  # unbounded by default — CI wants the whole answer
+    assert _resolve_deadline(90, Config({"deadline": 300})) == 90  # cli wins
+    assert _resolve_deadline(None, Config({"deadline": 300})) == 300  # then config
+    monkeypatch.setenv("GANDALF_DEADLINE", "120")
+    assert _resolve_deadline(None, Config({"deadline": 300})) == 120  # env beats config
+
+
+def test_past_the_deadline_a_tool_is_not_started() -> None:
+    """The run budget is enforced where every gate already degrades gracefully:
+    a tool call that cannot fit returns the timeout code, which `timeout_result`
+    turns into "did not run" — so the queue drains in milliseconds instead of
+    the whole process being killed by whatever was waiting on it."""
+    try:
+        plugins.set_deadline(0.001)
+        time.sleep(0.01)
+        rc, out, err = asyncio.run(plugins.run_tool(["python3", "-c", "print(1)"], "."))
+    finally:
+        plugins.set_deadline(None)
+    assert rc == plugins.TIMEOUT_RC
+    assert out == ""
+    assert "deadline" in err
+
+
+def test_without_a_deadline_a_tool_runs_normally() -> None:
+    plugins.set_deadline(None)
+    rc, out, _ = asyncio.run(plugins.run_tool(["python3", "-c", "print(1)"], "."))
+    assert (rc, out.strip()) == (0, "1")
+
+
+def test_a_container_that_never_started_is_not_a_clean_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """docker exits 125 when the container never ran at all — a refused mount, a
+    policy that blocks `--network host`. The scanner's stdout is then empty,
+    which every gate parser reads as "no findings": the one direction a quality
+    gate must never fail in.
+
+    A stub on PATH rather than the real daemon, so the test says the same thing
+    on a machine that has no docker.
+    """
+    stub = tmp_path / "docker"
+    stub.write_text("#!/bin/sh\necho 'docker: Error response from daemon' >&2\nexit 125\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))  # replace it; a prepend would find the real docker first
+
+    rc, out, err = asyncio.run(plugins.run_tool(["docker", "run", "gandalf-tools", "trivy"], "."))
+    assert rc == plugins.TIMEOUT_RC
+    assert out == ""
+    assert "daemon" in err

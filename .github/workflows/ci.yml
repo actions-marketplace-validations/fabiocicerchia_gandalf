@@ -17,6 +17,8 @@ concurrency:
 
 jobs:
   test:
+    # A github-actions bump touches workflow files only, never the code under test.
+    if: ${{ !startsWith(github.head_ref, 'dependabot/github_actions/') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -33,19 +35,23 @@ jobs:
 
       - name: Install
         run: |
-          python -m pip install --upgrade pip
-          # `pip install .[dev]` only warns when the extra does not exist, so it
-          # can "succeed" having installed no test runner at all. Fall back, and
-          # guarantee pytest either way — `make test` calls it by bare name.
-          if [ -f pyproject.toml ]; then
-            pip install -e ".[dev]" || pip install -e .
-          elif [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-          python -m pip show pytest >/dev/null 2>&1 || pip install pytest
+          # gandalf is stdlib-only, so pytest is the whole dev toolchain.
+          # Regenerate after changing requirements-dev.in:
+          #   uv pip compile requirements-dev.in --generate-hashes \
+          #     --universal -p 3.11 -o requirements-dev.txt
+          pip install --require-hashes -r requirements-dev.txt
 
       - name: Test
         run: make test
+
+      # FC-PY-003. Runs here rather than in pre-commit because a type checker
+      # with no dependencies installed reports every import as unresolved and
+      # every value that came through one as unknown -- noise that says nothing
+      # about this code. Once per matrix and not three times: the config pins
+      # the target version, so the other legs would only repeat the answer.
+      - name: Basedpyright
+        if: matrix.python-version == '3.11'
+        run: basedpyright
 
   # extensions/vscode is a separate TypeScript workspace with its own tests, and
   # publish-extension.yml packages it straight from a tag. Without this the tag

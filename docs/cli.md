@@ -7,13 +7,13 @@
 | `--commit <sha>` | Evaluate that commit (checked out in a temp worktree, auto-removed). |
 | `--staged` | Evaluate staged changes only. |
 | `--path <dir>` | Limit scanning to git-tracked files under a folder. On its own it scans the whole folder; with `--staged`/`--commit` it narrows that change set to the folder. |
-| `--no-llm` | Skip the LLM summary. |
-| `--debug` | Verbose stderr log: per-gate timing and every external command run (also via `GANDALF_DEBUG=1`). Steps the progress bar aside. Gate durations are always recorded under `duration` in the JSON. |
+| `--no-llm` | Skip everything that talks to the LLM: the summary **and** the LLM-backed judge gates (`grill_me`, `codebase_architecture`, `well_architected`, `compliance`, and the `skill_*` gates). They are listed as disabled in the report rather than run and reported amber. Each is a full round trip — or, with nothing listening at `GANDALF_LLM_URL`, a connect timeout and its retries — so this is usually the single biggest saving available to an editor or pre-commit run. |
+| `--debug` | Verbose stderr log, every line stamped with the elapsed time: each stage as it starts, the order gates were scheduled in, each gate's start and duration, and every external command with its timeout and exit code (also via `GANDALF_DEBUG=1`). The progress bar keeps drawing underneath it. This is how you find out where a scan that never finishes was spending its time — the end-of-run timings can only tell you about gates that got to the end. Gate durations are always recorded under `duration` in the JSON. |
 | `--fix` | Let every gate whose tool can fix its own findings do so, in the working tree, before scoring — so the scorecard reflects the fixed state and what is left is what actually needs a human. Cascades to `ruff --fix`, `ruff format`, `eslint --fix`, `golangci-lint --fix`, `cargo clippy --fix`, `sqlfluff fix`, `codespell -w` and shellcheck's own diff. Fixers run sequentially (order matters — a lint fix then a reformat of the same file), and each one's report is the set of files it actually rewrote, measured from the worktree. Ignored for `--commit` (throwaway worktree); with `--staged` the fixes land in the working tree, so `git add` them again before committing. |
 | `--no-html` | Skip the HTML report (JSON is always written). |
 | `--out-dir <dir>` | Write reports to `<dir>` instead of `<repo>/reports` (created if missing). Lets an editor integration or CI job keep its artifacts out of the working tree. |
 | `--no-trend` | Don't append this run to `.gandalf-trend.jsonl`. The score delta is still read from an existing log — useful when a tool re-runs gandalf often and shouldn't pollute the history. |
-| `--json` | Also dump the JSON payload to stdout. |
+| `--json` | Dump the JSON payload to stdout, and nothing else: the scorecard and the report paths go to stderr instead, so `gandalf --json \| jq` parses. |
 | `--stream` | Emit one NDJSON line per gate to stdout as it finishes, before the scorecard: `{"event":"start","scope":…,"gates":N}` then one `{"event":"gate","index":i,"total":N,"name":…,"outcome":…,"findings":[…],"category":…,"duration":…}` per gate, in completion order. Lets a consumer show results during the run instead of waiting for the report. Cache hits are reported too. Findings are baseline-suppressed, but the score is pre-severity-weighting and there is no verdict — those are properties of the whole run, so the final report remains the record. |
 | `--target <url>` | Live URL for the dynamic gates (nikto/sqlmap/dalfox). Without it they skip. |
 | `--allow-remote` | Permit dynamic scans against a non-localhost `--target`. |
@@ -27,7 +27,9 @@
 | `--exclude <glob>` | Skip paths matching the glob, for **every** gate. Repeatable. A bare name skips that directory anywhere (`node_modules`), a path anchors at the repository root (`src/generated`), and globs work (`*.min.js`). Adds to `.gandalfignore` and the built-in defaults rather than replacing them; `[gandalf] exclude = [...]` in `.gandalf.toml` does the same. |
 | `--explain-score` | Show how the composite was arrived at: every gate that counted, its score, its contribution, and the gates left out because they could not run. |
 | `--tool-versions` | Probe the version of every scanner that ran and record it in the report (one extra subprocess per tool). |
-| `--cache [PATH]` | Reuse a gate's prior result when the scanned files are unchanged (default `.gandalf-cache.json`). Ignored with `--target`/`--title`/`--body`. |
+| `--cache [PATH]` | Reuse a gate's prior result when the scanned files are unchanged (default `.gandalf-cache.json`). Ignored with `--target`/`--title`/`--body`. The file also carries how long each gate took, which is what the next run schedules by — see [Performance](performance.md). |
+| `--concurrency N` | Max gates in flight (`<=0` = unbounded; default: CPU count). Gates are submitted heaviest-first, so lowering this trades wall-clock for a responsive machine rather than leaving a five-minute scanner to start last. |
+| `--deadline N` | Wall-clock budget for the gate run, in seconds (`<=0` = unbounded, the default). Tool calls that no longer fit are not started, so the gates that ran are reported and the ones that did not are marked *did not run* — a long scan ends with a scorecard instead of being killed by whatever was waiting on it. |
 
 ## Suggested fixes
 

@@ -11,14 +11,15 @@ from __future__ import annotations
 import asyncio
 import shutil
 import subprocess
-import sys
+from pathlib import Path
+from typing import Any
 
 import pytest
 
-from gandalf.base import GateContext, GateOutcome
+from gandalf.base import GateContext, GateOutcome, GateResult
 from gandalf.gates import _toolchain
 from gandalf.plugins import discover_gates, scannable_files, tracked_files
-from gandalf.scope import _classify
+from gandalf.scope import classify
 
 GATES = {g.name: g for g in discover_gates()}
 
@@ -30,7 +31,7 @@ DOTNET = ("dotnet_build", "dotnet_format", "dotnet_audit", "dotnet_test")
 ALL = JAVA + RUBY + PHP + CPP + DOTNET
 
 
-def _repo(tmp_path, files: dict[str, str]) -> str:
+def _repo(tmp_path: Path, files: dict[str, str]) -> str:
     """A git repo with these files staged — gates read git-tracked paths."""
     for rel, body in files.items():
         p = tmp_path / rel
@@ -45,30 +46,30 @@ def _repo(tmp_path, files: dict[str, str]) -> str:
     return str(tmp_path)
 
 
-def _run(name: str, workdir: str, changed: list[str] | None = None):
+def _run(name: str, workdir: str, changed: list[str] | None = None) -> GateResult:
     ctx = GateContext(repo=workdir, workdir=workdir, changed_files=changed or [])
     return asyncio.run(GATES[name].run(ctx))
 
 
-def test_every_ecosystem_gate_is_discovered():
+def test_every_ecosystem_gate_is_discovered() -> None:
     assert set(ALL) <= set(GATES), f"missing: {set(ALL) - set(GATES)}"
 
 
-def test_only_the_build_and_syntax_gates_are_blocking():
+def test_only_the_build_and_syntax_gates_are_blocking() -> None:
     """A tree that does not compile or does not parse is a hard stop; a linter
     or an advisory scan never is — same split as the Go and Rust suites."""
     blocking = {n for n in ALL if GATES[n].blocking}
     assert blocking == {"java_build", "ruby_syntax", "php_syntax", "dotnet_build"}
 
 
-def test_cpp_build_is_advisory():
+def test_cpp_build_is_advisory() -> None:
     """C++ is the exception: a missing system library is the machine's fault,
     not the change's, so this one informs rather than blocks."""
     assert GATES["cpp_build"].blocking is False
 
 
 @pytest.mark.parametrize("name", ALL)
-def test_absent_ecosystem_is_a_green_skip(tmp_path, name):
+def test_absent_ecosystem_is_a_green_skip(tmp_path: Path, name: str) -> None:
     """A Python-only repo must not go amber for every language it does not use."""
     workdir = _repo(tmp_path, {"a.py": "x = 1\n"})
     r = _run(name, workdir)
@@ -95,21 +96,33 @@ def test_absent_ecosystem_is_a_green_skip(tmp_path, name):
     ],
 )
 def test_missing_toolchain_warns_and_names_the_binary(
-    tmp_path, monkeypatch, name, files, binary
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, files: dict[str, str], binary: str
+) -> None:
     """Amber, never a pass: the gate had something to look at and could not."""
+
     # Both namespaces: the base class asks _toolchain, and a gate that picks its
     # own tool (maven vs gradle, vendor/bin vs global) asks its own module.
-    monkeypatch.setattr(_toolchain, "tool_missing", lambda _b: True)
-    gate_module = sys.modules[type(GATES[name]).__module__]
-    if hasattr(gate_module, "tool_missing"):
-        monkeypatch.setattr(gate_module, "tool_missing", lambda _b: True)
+    # That second namespace has to come off the class itself. Looking it up as
+    # sys.modules[cls.__module__] finds the wrong object: discover_gates()
+    # re-executes every gate file on each call and rebinds `gandalf_gate_<stem>`
+    # to a fresh module, so once another test module has discovered gates the
+    # entry under that name is no longer the namespace this class resolves
+    # against — and the gate would go on to shell out to a real mvn.
+    def missing(_b: str) -> bool:
+        return True
+
+    monkeypatch.setattr(_toolchain, "tool_missing", missing)
+    check = getattr(type(GATES[name]), "check", None)
+    gate_globals: dict[str, Any] = getattr(check, "__globals__", {})
+    if "tool_missing" in gate_globals:
+        monkeypatch.setitem(gate_globals, "tool_missing", missing)
     r = _run(name, _repo(tmp_path, files))
     assert r.outcome is GateOutcome.WARN, r.summary
-    assert binary in r.summary and "skipped" in r.summary
+    assert binary in r.summary
+    assert "skipped" in r.summary
 
 
-def test_project_dir_finds_the_shallowest_manifest(tmp_path):
+def test_project_dir_finds_the_shallowest_manifest(tmp_path: Path) -> None:
     """A .csproj two directories down is still a .NET project, and the tool has
     to run where the manifest is — the repo root would find nothing."""
     workdir = _repo(
@@ -120,11 +133,13 @@ def test_project_dir_finds_the_shallowest_manifest(tmp_path):
         },
     )
     ctx = GateContext(repo=workdir, workdir=workdir)
-    assert _toolchain.project_dir(ctx, ("*.csproj",)).endswith("src/App")
+    found = _toolchain.project_dir(ctx, ("*.csproj",))
+    assert found is not None
+    assert found.endswith("src/App")
     assert _toolchain.project_dir(ctx, ("*.sln",)) is None
 
 
-def test_counted_scoring_matches_the_house_rules():
+def test_counted_scoring_matches_the_house_rules() -> None:
     c = _toolchain.counted
     assert c("g", 0, "l").outcome is GateOutcome.PASS
     assert c("g", 3, "l").outcome is GateOutcome.WARN
@@ -133,7 +148,7 @@ def test_counted_scoring_matches_the_house_rules():
     assert c("g", 99, "l").score == 0.0  # clamped, never negative
 
 
-def test_sources_prefers_the_change_over_the_tree(tmp_path):
+def test_sources_prefers_the_change_over_the_tree(tmp_path: Path) -> None:
     workdir = _repo(tmp_path, {"a.rb": "1\n", "b.rb": "2\n", "c.py": "x = 1\n"})
     whole = GateContext(repo=workdir, workdir=workdir)
     assert _toolchain.sources(whole, ".rb") == ["a.rb", "b.rb"]
@@ -141,17 +156,17 @@ def test_sources_prefers_the_change_over_the_tree(tmp_path):
     assert _toolchain.sources(scoped, ".rb") == ["b.rb"]
 
 
-def test_language_markers_classify_the_new_ecosystems():
-    assert _classify(["pom.xml"]) == {"java"}
-    assert _classify(["src/Main.kt"]) == {"kotlin"}
-    assert _classify(["Gemfile"]) == {"ruby"}
-    assert _classify(["composer.json"]) == {"php"}
-    assert _classify(["CMakeLists.txt"]) == {"cpp"}
-    assert _classify(["src/main.cpp", "src/util.h"]) == {"cpp", "c"}
-    assert _classify(["App/App.csproj", "App/Program.cs"]) == {"dotnet"}
+def test_language_markers_classify_the_new_ecosystems() -> None:
+    assert classify(["pom.xml"]) == {"java"}
+    assert classify(["src/Main.kt"]) == {"kotlin"}
+    assert classify(["Gemfile"]) == {"ruby"}
+    assert classify(["composer.json"]) == {"php"}
+    assert classify(["CMakeLists.txt"]) == {"cpp"}
+    assert classify(["src/main.cpp", "src/util.h"]) == {"cpp", "c"}
+    assert classify(["App/App.csproj", "App/Program.cs"]) == {"dotnet"}
 
 
-def test_a_stray_ruby_config_does_not_make_a_ruby_project(tmp_path):
+def test_a_stray_ruby_config_does_not_make_a_ruby_project(tmp_path: Path) -> None:
     """`.mdl_style.rb` is a markdown-lint config, and this repo has one. It is
     worth a parse check and nothing else — a linter and a test runner turning
     amber over one config file is exactly the false positive that makes a
@@ -159,38 +174,38 @@ def test_a_stray_ruby_config_does_not_make_a_ruby_project(tmp_path):
     workdir = _repo(tmp_path, {"a.py": "x = 1\n", ".mdl_style.rb": "all\n"})
     for name in ("rubocop", "ruby_test", "bundler_audit"):
         r = _run(name, workdir)
-        assert r.outcome is GateOutcome.PASS and "not in this tree" in r.summary
+        assert r.outcome is GateOutcome.PASS
+        assert "not in this tree" in r.summary
 
 
 @pytest.mark.skipif(shutil.which("ruby") is None, reason="needs ruby")
-def test_ruby_syntax_reads_real_ruby(tmp_path):
+def test_ruby_syntax_reads_real_ruby(tmp_path: Path) -> None:
     """The one gate this machine can always exercise end to end."""
     good = _run("ruby_syntax", _repo(tmp_path / "ok", {"lib/a.rb": "def hi\nend\n"}))
     # The summary too: a self-skip is also a green pass, and that would hide a
     # gate that never looked at the file.
-    assert good.outcome is GateOutcome.PASS and "1 file(s) parse" in good.summary
+    assert good.outcome is GateOutcome.PASS
+    assert "1 file(s) parse" in good.summary
 
     bad = _run("ruby_syntax", _repo(tmp_path / "bad", {"lib/a.rb": "def hi\n"}))
     assert bad.outcome is GateOutcome.FAIL
     assert bad.score == 0.0
-    assert bad.findings and bad.findings[0]["file"] == "lib/a.rb"
+    assert bad.findings
+    assert bad.findings[0]["file"] == "lib/a.rb"
 
 
-@pytest.mark.skipif(
-    shutil.which("cmake") is None or shutil.which("c++") is None, reason="needs cmake"
-)
-def test_cpp_build_compiles_and_fails_honestly(tmp_path):
-    cml = (
-        "cmake_minimum_required(VERSION 3.10)\n"
-        "project(demo CXX)\nadd_executable(demo main.cpp)\n"
-    )
+@pytest.mark.skipif(shutil.which("cmake") is None or shutil.which("c++") is None, reason="needs cmake")
+def test_cpp_build_compiles_and_fails_honestly(tmp_path: Path) -> None:
+    cml = "cmake_minimum_required(VERSION 3.10)\nproject(demo CXX)\nadd_executable(demo main.cpp)\n"
     ok = _repo(tmp_path / "ok", {"CMakeLists.txt": cml, "main.cpp": "int main(){}\n"})
     built = _run("cpp_build", ok)
-    assert built.outcome is GateOutcome.PASS and "compiles" in built.summary
+    assert built.outcome is GateOutcome.PASS
+    assert "compiles" in built.summary
 
     broken = _repo(
         tmp_path / "bad",
         {"CMakeLists.txt": cml, "main.cpp": "int main(){ return nope; }\n"},
     )
     r = _run("cpp_build", broken)
-    assert r.outcome is GateOutcome.FAIL and r.score == 0.0
+    assert r.outcome is GateOutcome.FAIL
+    assert r.score == 0.0

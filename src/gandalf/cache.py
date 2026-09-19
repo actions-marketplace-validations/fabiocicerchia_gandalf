@@ -20,16 +20,23 @@ change gate behavior without changing any file.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .base import Gate
+
 import hashlib
 import json
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from functools import lru_cache
+from importlib import metadata
 from pathlib import Path
+from typing import Any, cast
 
 from . import plugins
 from .base import GateOutcome, GateResult
-from .plugins import ignore_patterns, is_ignored, scannable_files
+from .plugins import NamedGate, did_not_run, ignore_patterns, is_ignored, scannable_files
 
 DEFAULT_CACHE = ".gandalf-cache.json"
 
@@ -65,9 +72,13 @@ def _gandalf_version() -> str:
     """Best effort — an installed wrapper may not ship version.txt, and a missing
     version just means this component contributes nothing to the salt."""
     try:
-        return (Path(__file__).resolve().parents[2] / "version.txt").read_text().strip()
-    except OSError:
-        return ""
+        return metadata.version("gandalf")
+    except metadata.PackageNotFoundError:
+        # Running straight from a checkout, with nothing installed.
+        try:
+            return (Path(__file__).resolve().parents[2] / "version.txt").read_text().strip()
+        except OSError:
+            return ""
 
 
 def toolchain_salt() -> str:
@@ -84,7 +95,7 @@ def toolchain_salt() -> str:
     return f"v{CACHE_VERSION}|{_gandalf_version()}|{plugins.tools_image_id()}"
 
 
-def max_age(gate) -> float | None:
+def max_age(gate: NamedGate) -> float | None:
     """Seconds a cached result for this gate stays valid, or None for forever."""
     ttl = getattr(gate, "cache_ttl", None)
     if ttl is not None:
@@ -93,16 +104,14 @@ def max_age(gate) -> float | None:
 
 
 def target_files(workdir: str, changed_files: list[str]) -> list[str]:
-    """Same file-set logic as plugins._scan_targets: the change's own files,
+    """Same file-set logic as plugins.scan_targets: the change's own files,
     falling back to the whole tracked tree, minus anything excluded.
 
     Excluded files are left out on purpose — the hash decides whether a gate's
     cached result still holds, and a file no gate reads cannot change it."""
     root = Path(workdir)
     pats = ignore_patterns(workdir)
-    files = [
-        f for f in changed_files if (root / f).is_file() and not is_ignored(f, pats)
-    ]
+    files = [f for f in changed_files if (root / f).is_file() and not is_ignored(f, pats)]
     if files:
         return files
     return [f for f in scannable_files(workdir) if (root / f).is_file()]
@@ -131,7 +140,7 @@ def content_hash(workdir: str, files: list[str], salt: str = "") -> str:
     return h.hexdigest()
 
 
-def load(path: str) -> dict:
+def load(path: str) -> dict[str, Any]:
     """Read the cache file, or an empty cache.
 
     A missing, unreadable or corrupt file is not an error — the worst it can
@@ -146,15 +155,21 @@ def load(path: str) -> dict:
         return {}
 
 
-def save(path: str, data: dict) -> None:
-    """Write the cache back, pretty-printed so a diff on it is readable."""
-    with Path(path).open("w", encoding="utf-8") as fh:
+def save(path: str, data: dict[str, Any]) -> None:
+    """Write the cache back, pretty-printed so a diff on it is readable.
+
+    Written to a sibling and renamed, because it is now written after every gate
+    rather than once at the end: a run killed mid-write would otherwise leave a
+    truncated file, and a corrupt cache costs exactly the full re-run this is
+    here to avoid. `replace` is atomic within a directory.
+    """
+    tmp = Path(f"{path}.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, default=str)
+    tmp.replace(path)
 
 
-def get(
-    cache: dict, gate_name: str, file_hash: str, max_age_s: float | None = None
-) -> GateResult | None:
+def get(cache: dict[str, Any], gate_name: str, file_hash: str, max_age_s: float | None = None) -> GateResult | None:
     """The cached result for a gate, if it was recorded against this hash and is
     not older than `max_age_s` (None = no expiry).
 
@@ -171,7 +186,7 @@ def get(
         ts = entry.get("ts")
         if not isinstance(ts, (int, float)) or time.time() - ts > max_age_s:
             return None
-    r = entry.get("result") or {}
+    r: dict[str, Any] = entry.get("result") or {}
     try:
         return GateResult(
             r["name"],
@@ -184,14 +199,126 @@ def get(
         return None
 
 
-def put(cache: dict, gate_name: str, file_hash: str, result: GateResult) -> None:
+def put(cache: dict[str, Any], gate_name: str, file_hash: str, result: GateResult) -> None:
     """Record a gate's result against the hash of the files it saw, and when.
 
     The timestamp is what lets a dependency verdict expire while the lockfile
     that produced it stays byte-identical — see `max_age`.
+
+    The wall-clock is recorded too, and is read back by `timings` regardless of
+    the hash: what a gate cost last time stays true after the code changes, and
+    it is what the scheduler orders the next run by.
     """
-    cache[gate_name] = {
+    entry: dict[str, Any] = {
         "hash": file_hash,
         "ts": time.time(),
         "result": asdict(result),
     }
+    if (duration := plugins.meta(result, "duration")) is not None:
+        entry["duration"] = duration
+    cache[gate_name] = entry
+
+
+def timings(cache: dict[str, Any]) -> dict[str, float]:
+    """gate name → seconds it took the last time it actually ran.
+
+    Deliberately not keyed on the content hash: a stale entry's *verdict* is
+    worthless, but its *duration* is still the best estimate of what that gate
+    costs on this repository and this machine. Entries written before durations
+    were recorded simply aren't in here.
+    """
+    out: dict[str, float] = {}
+    for name, entry in cache.items():
+        if not isinstance(entry, dict):
+            continue
+        d: object = cast("dict[str, Any]", entry).get("duration")
+        if isinstance(d, (int, float)) and d >= 0:
+            out[name] = float(d)
+    return out
+
+
+def _in_gate_order(results: list[GateResult], active: list[Gate]) -> list[GateResult]:
+    """`results` sorted to follow `active`, losing none of them.
+
+    Ordering a report by the gate list is presentation; it must not also decide
+    which results exist. Two cases where a name doesn't line up, and neither is
+    a reason to drop anything: a gate whose cached entry expired between
+    `pending` and here has no result at all (indexing `active` would raise),
+    and a third-party gate whose `GateResult.name` differs from its own `name`
+    has one that no `active` entry claims (it would vanish). Named results come
+    first, in gate order; anything unclaimed follows, in the order it arrived.
+    """
+    by_name = {r.name: r for r in results}
+    ordered = [by_name[g.name] for g in active if g.name in by_name]
+    claimed = {id(r) for r in ordered}
+    return ordered + [r for r in results if id(r) not in claimed]
+
+
+@dataclass
+class Plan:
+    """What this run may skip, and how the skipped results come back.
+
+    An inert Plan — no path — is what a run gets when the cache cannot apply:
+    the content hash cannot see --target, --title or --body, and those change
+    what a gate reports without changing a file. Every method then behaves as
+    if nothing were cached, so the caller has no branch to write.
+    """
+
+    path: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+    file_hash: str = ""
+
+    def timings(self) -> dict[str, float]:
+        """What each gate cost the last time it ran, for the scheduler. Empty
+        for an inert plan — with no cache file there is nowhere to have kept
+        them, and the scheduler falls back to its priors."""
+        return timings(self.data) if self.path is not None else {}
+
+    def pending(self, active: list[Gate]) -> list[Gate]:
+        """The gates with no live cache entry — all of them when caching is off."""
+        if self.path is None:
+            return active
+        return [g for g in active if get(self.data, g.name, self.file_hash, max_age(g)) is None]
+
+    def record(self, result: GateResult) -> None:
+        """Bank one finished gate, there and then.
+
+        Banked as each gate lands rather than all at the end, because the run
+        that most needs a cache is the one that never reaches the end: an editor
+        scan killed at its own timeout saved nothing, so the next scan re-ran the
+        thirty gates that had already finished and was killed in the same place.
+
+        A result that did not actually run is not recorded: "tool missing" and
+        "timed out" are not answers worth keeping for six hours, and caching them
+        would make one bad run stick.
+        """
+        if self.path is None or did_not_run(result):
+            return
+        put(self.data, result.name, self.file_hash, result)
+        save(self.path, self.data)
+
+    def merge(
+        self, fresh: list[GateResult], active: list[Gate], ran: list[Gate]
+    ) -> tuple[list[GateResult], list[GateResult]]:
+        """Store what just ran → (every result in `active` order, the cached ones).
+
+        The cached ones come back separately because they never ran, so nothing
+        has reported them yet — --stream still has to.
+
+        `active` order rather than completion order, for both branches: gates are
+        submitted heaviest-first (see `schedule`) and finish in whatever order
+        they finish, and a report whose gate list reshuffles run to run is a
+        diff nobody can read.
+        """
+        if self.path is None:
+            return _in_gate_order(fresh, active), []
+        for r in fresh:
+            self.record(r)  # a no-op re-save for anything the runner already banked
+        # `get` returns None for an entry that expired between the pending
+        # check and here; those gates simply have no cached result to merge.
+        cached = [
+            found
+            for g in active
+            if g not in ran and (found := get(self.data, g.name, self.file_hash, max_age(g))) is not None
+        ]
+        return _in_gate_order(fresh + cached, active), cached

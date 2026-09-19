@@ -2,7 +2,7 @@
 # Build:  make tools   (or: docker build -t gandalf-tools -f gandalf/tools.Dockerfile gandalf)
 # gandalf runs each tool atomically as `docker run --rm gandalf-tools <tool> ...`
 # when the binary isn't on the host PATH. Pinned for reproducibility — bump freely.
-FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4
+FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
 
 # OCI labels — org.opencontainers.image.source links the ghcr package to this repo
 # (so it inherits repo visibility and the built-in GITHUB_TOKEN can pull it).
@@ -22,9 +22,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Python-packaged tools (scanners + type/dead-code/yaml/spell/sql/docs/complexity)
-RUN pip install --no-cache-dir \
-      ruff semgrep bandit pip-audit checkov \
-      mypy vulture codespell yamllint sqlfluff interrogate lizard
+COPY tools-requirements.txt /tmp/tools-requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r /tmp/tools-requirements.txt \
+ && rm /tmp/tools-requirements.txt
 
 # squawk — Postgres migration linter (single binary)
 RUN curl -sSfL "https://github.com/sbdchd/squawk/releases/download/v${SQUAWK_VERSION}/squawk-linux-x64" \
@@ -49,8 +49,10 @@ RUN curl -sSfL "https://github.com/hadolint/hadolint/releases/download/v${HADOLI
       | tar -xz -C /usr/local/bin actionlint \
  && curl -sSfL "https://github.com/ossf/scorecard/releases/download/v${SCORECARD_VERSION}/scorecard_${SCORECARD_VERSION}_linux_amd64.tar.gz" \
       | tar -xz -C /usr/local/bin scorecard \
- && curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-      | sh -s -- -b /usr/local/bin
+ && curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/75c4dc0f45c5d7ffd05ae26df1e0c666787bdf2a/contrib/install.sh \
+      -o /tmp/trivy-install.sh \
+ && sh /tmp/trivy-install.sh -b /usr/local/bin \
+ && rm /tmp/trivy-install.sh
 
 # Run as a non-root user (uid 1000 to match the typical host user, so tools that
 # write into the mounted /src worktree — e.g. `ruff format` under --fix — and the

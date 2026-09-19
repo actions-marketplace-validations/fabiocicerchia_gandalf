@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import subprocess
 import time
+from pathlib import Path
 
 from gandalf import plugins, scope
+from gandalf.ignores import compiled_ignores
 from gandalf.plugins import (
-    _compiled_ignores,
     ignore_patterns,
     is_ignored,
     scannable_files,
@@ -25,7 +26,7 @@ from gandalf.plugins import (
 )
 
 
-def _repo(tmp_path, files):
+def _repo(tmp_path: Path, files: list[str]) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
     for rel in files:
@@ -43,15 +44,15 @@ def _repo(tmp_path, files):
     return repo
 
 
-def _reset_caches():
+def _reset_caches() -> None:
     plugins.set_extra_ignores([])
     tracked_files.cache_clear()
     scannable_files.cache_clear()
     ignore_patterns.cache_clear()
-    _compiled_ignores.cache_clear()
+    compiled_ignores.cache_clear()
 
 
-def test_ignore_patterns_are_compiled_once_for_a_whole_tree_walk():
+def test_ignore_patterns_are_compiled_once_for_a_whole_tree_walk() -> None:
     """`is_ignored` is called once per file — on a large repo, tens of thousands
     of times. It must not rebuild the regex alternation on each of them."""
     _reset_caches()
@@ -60,12 +61,12 @@ def test_ignore_patterns_are_compiled_once_for_a_whole_tree_walk():
     for i in range(5_000):
         is_ignored(f"src/pkg{i % 50}/mod{i}.py", pats)
 
-    info = _compiled_ignores.cache_info()
+    info = compiled_ignores.cache_info()
     assert info.misses == 1, f"compiled {info.misses} times for one pattern set"
     assert info.hits == 4_999
 
 
-def test_the_tracked_listing_is_read_from_git_once_per_workdir(tmp_path):
+def test_the_tracked_listing_is_read_from_git_once_per_workdir(tmp_path: Path) -> None:
     """Every gate asks for the same file list. Shelling out to git per gate is
     ~35 subprocesses for one answer that cannot have changed mid-run."""
     _reset_caches()
@@ -78,7 +79,7 @@ def test_the_tracked_listing_is_read_from_git_once_per_workdir(tmp_path):
     assert scannable_files.cache_info().misses == 1, "and one filter pass over it"
 
 
-def test_languages_reuses_that_listing_instead_of_asking_git_again(tmp_path):
+def test_languages_reuses_that_listing_instead_of_asking_git_again(tmp_path: Path) -> None:
     """`languages()` runs immediately before the gates do, against the same tree.
 
     It used to issue its own `git ls-files`, so every whole-tree scan paid for
@@ -97,7 +98,7 @@ def test_languages_reuses_that_listing_instead_of_asking_git_again(tmp_path):
     assert after.hits == before.hits + 1, "it read the cached one"
 
 
-def test_a_scoped_run_never_touches_the_tracked_listing_at_all(tmp_path):
+def test_a_scoped_run_never_touches_the_tracked_listing_at_all(tmp_path: Path) -> None:
     """With a changed set in hand there is nothing to list — a --staged scan of
     three files must not enumerate a 25k-file tree to classify them."""
     _reset_caches()
@@ -107,7 +108,7 @@ def test_a_scoped_run_never_touches_the_tracked_listing_at_all(tmp_path):
     assert tracked_files.cache_info().misses == 0, "git was never asked"
 
 
-def test_filtering_a_large_tree_stays_linear():
+def test_filtering_a_large_tree_stays_linear() -> None:
     """The tripwire. 25k paths against a realistic pattern set is what a scan of
     a large untended repo costs; it is ~30ms when the pattern match is a set
     lookup plus one alternation, and minutes if it goes back to fnmatching every
@@ -115,7 +116,7 @@ def test_filtering_a_large_tree_stays_linear():
     or loaded runner cannot trip it on its own.
     """
     _reset_caches()
-    pats = ignore_patterns(".") + ("*.min.js", "src/generated", "vendor")
+    pats = (*ignore_patterns("."), "*.min.js", "src/generated", "vendor")
     paths = [f"src/pkg{i % 200}/mod{i}.py" for i in range(25_000)]
 
     started = time.monotonic()

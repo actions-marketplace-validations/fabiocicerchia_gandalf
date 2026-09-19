@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 from . import debug
 
@@ -24,9 +25,7 @@ MAX_TOKENS = int(os.environ.get("GANDALF_MAX_TOKENS", "8000"))
 API_KEY = os.environ.get("GANDALF_API_KEY", "sk-no-key-required")
 
 # Transient-failure retry: a flaky network shouldn't silently degrade the summary.
-RETRIES = int(
-    os.environ.get("GANDALF_LLM_RETRIES", "3")
-)  # 3 retries before a judge skips (4 attempts)
+RETRIES = int(os.environ.get("GANDALF_LLM_RETRIES", "3"))  # 3 retries before a judge skips (4 attempts)
 BACKOFF = float(os.environ.get("GANDALF_LLM_BACKOFF", "1.0"))  # base seconds
 # Retry only on transient HTTP statuses; 4xx (bad request/auth) won't fix on retry.
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
@@ -35,7 +34,11 @@ _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 CONNECT_TIMEOUT = float(os.environ.get("GANDALF_LLM_CONNECT_TIMEOUT", "10"))
 
 
-class LLMUnreachable(OSError):
+# Shorter than this and the model has said nothing worth showing.
+MIN_BODY_CHARS = 160
+
+
+class LLMUnreachableError(OSError):
     """Nothing accepted a connection at the endpoint within CONNECT_TIMEOUT."""
 
 
@@ -55,7 +58,7 @@ def _check_connectable(url: str) -> None:
         with socket.create_connection((parts.hostname or "", port), CONNECT_TIMEOUT):
             pass
     except OSError as exc:
-        raise LLMUnreachable(
+        raise LLMUnreachableError(
             f"no connection to {parts.hostname}:{port} within {CONNECT_TIMEOUT:g}s ({exc})"
         ) from exc
 
@@ -69,32 +72,32 @@ def _retryable(exc: Exception) -> bool:
     """
     # Checked before OSError below, which it subclasses: nothing is listening, so
     # a retry buys another CONNECT_TIMEOUT of waiting and the same answer.
-    if isinstance(exc, LLMUnreachable):
+    if isinstance(exc, LLMUnreachableError):
         return False
     if isinstance(exc, urllib.error.HTTPError):  # subclass of URLError — check first
         return exc.code in _RETRY_STATUS
     return isinstance(exc, (urllib.error.URLError, TimeoutError, OSError))
 
 
-def _request_with_retry(req: urllib.request.Request, timeout: int) -> dict:
+def _request_with_retry(req: urllib.request.Request, timeout: int) -> dict[str, Any]:
     """POST with exponential backoff on transient failures. Raises the last
     exception once retries are exhausted (or immediately for non-retryable ones)."""
     for attempt in range(RETRIES + 1):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 — operator-configured endpoint
+            # The endpoint comes from validated operator config, not from user
+            # input; both markers are for the same fact, one per tool.
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310  # noqa: S310
                 return json.load(resp)
         except Exception as exc:
             if attempt >= RETRIES or not _retryable(exc):
                 raise
             delay = BACKOFF * (2**attempt)
-            debug.log(
-                f"LLM request failed ({exc}); retry {attempt + 1}/{RETRIES} in {delay:.1f}s"
-            )
+            debug.log(f"LLM request failed ({exc}); retry {attempt + 1}/{RETRIES} in {delay:.1f}s")
             time.sleep(delay)
     raise RuntimeError("unreachable")  # loop either returns or raises
 
 
-def _context(workdir: str, label: str, diff: str) -> str:
+def repo_context(workdir: str, label: str, diff: str) -> str:
     """Build the repo context sent alongside the findings.
 
     Truncated hard: the summary is worth what the model can attend to, and a
@@ -109,7 +112,7 @@ def _context(workdir: str, label: str, diff: str) -> str:
             break
     try:
         tree = subprocess.run(  # nosec B603 B607 - fixed git argv, no shell
-            ["git", "ls-files"],
+            ["git", "ls-files"],  # noqa: S607 — resolved from PATH on purpose: the tool may be a host binary or a shim
             cwd=workdir,
             capture_output=True,
             text=True,
@@ -120,7 +123,8 @@ def _context(workdir: str, label: str, diff: str) -> str:
         tree = ""
     try:
         log = subprocess.run(  # nosec B603 B607 - fixed git argv, no shell
-            ["git", "log", "-5", "--oneline"],
+            # Resolved from PATH on purpose: the tool may be a host binary or a shim
+            ["git", "log", "-5", "--oneline"],  # noqa: S607
             cwd=workdir,
             capture_output=True,
             text=True,
@@ -142,7 +146,7 @@ def _context(workdir: str, label: str, diff: str) -> str:
     return "\n\n".join(parts)
 
 
-def chat(messages: list[dict], *, temperature: float = 0.2, timeout: int = 120) -> str:
+def chat(messages: list[dict[str, Any]], *, temperature: float = 0.2, timeout: int = 120) -> str:
     """Low-level completion. Raises on transport/parse failure — callers decide
     how to degrade (summarize swallows it; the compliance gate reports FAIL)."""
     body = json.dumps(
@@ -157,7 +161,7 @@ def chat(messages: list[dict], *, temperature: float = 0.2, timeout: int = 120) 
     # Once this returns, the endpoint is up and `timeout` is the generation
     # budget it gets — a slow model is fine, an absent one is not.
     _check_connectable(url)
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310 — endpoint comes from validated config, not user input
         url,
         data=body,
         headers={
@@ -171,19 +175,17 @@ def chat(messages: list[dict], *, temperature: float = 0.2, timeout: int = 120) 
     # reasoning field, or emit nothing usable if they exhaust tokens while thinking.
     content = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning")
     if not content:
-        raise ValueError(
-            f"empty completion (finish_reason={data['choices'][0].get('finish_reason')})"
-        )
+        raise ValueError(f"empty completion (finish_reason={data['choices'][0].get('finish_reason')})")
     return content.strip()
 
 
 _SECTIONS = ("summary", "changeset", "remediation", "improvement")
 
 
-def _split_sections(text: str) -> dict:
+def _split_sections(text: str) -> dict[str, Any]:
     """Split the model reply on @@MARKER@@ lines into the sections. If the model
     ignored the format, the whole reply becomes the summary."""
-    out = {k: "" for k in _SECTIONS}
+    out: dict[str, Any] = dict.fromkeys(_SECTIONS, "")
     key: str | None = None
     buf: list[str] = []
     for line in text.splitlines():
@@ -206,7 +208,7 @@ def _split_sections(text: str) -> dict:
     return out
 
 
-def analyze(workdir: str, label: str, diff: str, verdict: str, scorecard: str) -> dict:
+def analyze(workdir: str, label: str, diff: str, verdict: str, scorecard: str) -> dict[str, Any]:
     """One LLM call → {summary, changeset, remediation, improvement} as markdown.
     Changeset/remediation/improvement are grounded in the gate results (scorecard)."""
     prompt = (
@@ -239,19 +241,18 @@ def analyze(workdir: str, label: str, diff: str, verdict: str, scorecard: str) -
         "@@IMPROVEMENT@@\n"
         "Ways to raise the bar BEYOND merely passing — stricter configs, missing "
         "tests/coverage, docs, architecture — things not already flagged above.\n\n"
-        f"## Verdict\n{verdict}\n\n## Gate results\n{scorecard}\n\n"
-        + _context(workdir, label, diff)
+        f"## Verdict\n{verdict}\n\n## Gate results\n{scorecard}\n\n" + repo_context(workdir, label, diff)
     )
     try:
         adv = _split_sections(chat([{"role": "user", "content": prompt}]))
-    except Exception as exc:  # noqa: BLE001 — LLM issues must never crash the run; degrade instead
-        adv = {
+    except Exception as exc:
+        adv: dict[str, Any] = {
             "summary": f"LLM unavailable ({LLM_URL}, model {MODEL}): {exc}",
             "changeset": "",
             "remediation": "",
             "improvement": "",
         }
-    adv["remediation_pre"], adv["remediation_groups"] = _split_gates(adv["remediation"])
+    adv["remediation_pre"], adv["remediation_groups"] = _split_gates(str(adv["remediation"]))
     return adv
 
 
@@ -294,4 +295,4 @@ def _has_fix(body: str) -> bool:
     filtered here rather than left to the reader.
     """
     b = body.strip()
-    return bool(b) and not (len(b) < 160 and _STUB.search(b))
+    return bool(b) and not (len(b) < MIN_BODY_CHARS and _STUB.search(b))

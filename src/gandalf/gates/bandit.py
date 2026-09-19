@@ -6,9 +6,9 @@ import json
 
 from gandalf.base import GateContext, GateOutcome, GateResult
 from gandalf.plugins import (
-    _scan_targets,
     missing_result,
     run_tool,
+    scan_targets,
     timeout_result,
     unavailable,
 )
@@ -26,7 +26,7 @@ class BanditGate:
             [
                 "bandit",
                 "-r",
-                *_scan_targets(ctx, py_only=True),
+                *scan_targets(ctx, py_only=True),
                 "-f",
                 "json",
                 "-q",
@@ -51,6 +51,4 @@ class BanditGate:
         high = sum(1 for r in results if r.get("issue_severity") == "HIGH")
         score = max(0.0, 1.0 - (high * 0.2 + (n - high) * 0.05))
         outcome = GateOutcome.FAIL if high > 0 else GateOutcome.WARN
-        return GateResult(
-            self.name, outcome, score, f"bandit: {n} issue(s), {high} HIGH", results
-        )
+        return GateResult(self.name, outcome, score, f"bandit: {n} issue(s), {high} HIGH", results)

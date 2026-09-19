@@ -14,12 +14,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from gandalf.base import GateContext, GateOutcome, GateResult
 from gandalf.gates._toolchain import (
     ToolchainGate,
     counted,
     exit_code,
+    merged,
+    obj,
+    objects,
+    parsed,
     per_file,
     project_dir,
     tail,
@@ -54,9 +59,23 @@ class PhpSyntaxGate(ToolchainGate):
     binary = "php"
 
     async def check(self, ctx: GateContext, root: str) -> GateResult:
-        return await per_file(
-            self.name, ["php", "-l", "-n"], ctx, (".php",), label="php -l"
-        )
+        return await per_file(self.name, ["php", "-l", "-n"], ctx, (".php",), label="php -l")
+
+
+def _phpcs_findings(data: object) -> list[dict[str, Any]]:
+    """phpcs' per-file message lists, flattened."""
+    return [
+        {
+            "file": path,
+            "line": m.get("line", 0),
+            "column": m.get("column", 0),
+            "rule": m.get("source", ""),
+            "message": m.get("message", ""),
+            "severity": str(m.get("type") or "").lower(),
+        }
+        for path, f in obj(obj(data).get("files")).items()
+        for m in objects(obj(f).get("messages"))
+    ]
 
 
 class PhpcsGate(ToolchainGate):
@@ -78,30 +97,14 @@ class PhpcsGate(ToolchainGate):
         phpcs = _vendored(root, "phpcs")
         if phpcs is None:
             return self.missing("phpcs")
-        rc, out, err = await run_tool(
-            [phpcs, "--report=json", "--no-colors", *self._standard(root), "."], root
-        )
+        rc, out, err = await run_tool([phpcs, "--report=json", "--no-colors", *self._standard(root), "."], root)
         if (to := timeout_result(self.name, rc)) is not None:
             return to
-        try:
-            data = json.loads(out or "{}")
-        except json.JSONDecodeError:
-            return unavailable(
-                self.name, f"phpcs: did not run — {tail((out or '') + (err or ''), 2)}"
-            )
-        findings = [
-            {
-                "file": path,
-                "line": m.get("line", 0),
-                "column": m.get("column", 0),
-                "rule": m.get("source", ""),
-                "message": m.get("message", ""),
-                "severity": (m.get("type") or "").lower(),
-            }
-            for path, f in (data.get("files") or {}).items()
-            for m in f.get("messages") or []
-        ]
-        totals = data.get("totals") or {}
+        data = parsed(out)
+        if data is None:
+            return unavailable(self.name, f"phpcs: did not run — {tail(merged(out, err), 2)}")
+        findings = _phpcs_findings(data)
+        totals = obj(obj(data).get("totals"))
         n = totals.get("errors", 0) + totals.get("warnings", 0) or len(findings)
         return counted(self.name, n, "phpcs", findings[:50], noun="violation(s)")
 
@@ -129,9 +132,7 @@ class ComposerAuditGate(ToolchainGate):
     binary = "composer"
 
     async def check(self, ctx: GateContext, root: str) -> GateResult:
-        rc, out, err = await run_tool(
-            ["composer", "audit", "--format=json", "--no-interaction"], root
-        )
+        rc, out, err = await run_tool(["composer", "audit", "--format=json", "--no-interaction"], root)
         if (to := timeout_result(self.name, rc)) is not None:
             return to
         try:
@@ -147,13 +148,11 @@ class ComposerAuditGate(ToolchainGate):
                 "url": a.get("link", ""),
                 "severity": a.get("severity", ""),
             }
-            for pkg, items in (data.get("advisories") or {}).items()
-            for a in items
+            for pkg, items in obj(obj(data).get("advisories")).items()
+            for a in objects(items)
         ]
         if not advisories:
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "composer audit: no known advisories"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "composer audit: no known advisories")
         n = len(advisories)
         score = max(0.0, 1.0 - min(n, 10) / 10)
         return GateResult(
@@ -175,12 +174,8 @@ class PhpunitGate(ToolchainGate):
         phpunit = _vendored(root, "phpunit")
         if phpunit is None:
             return self.missing("phpunit")
-        if not any(
-            (Path(root) / rel).is_file() for rel in ("phpunit.xml", "phpunit.xml.dist")
-        ):
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "php: no phpunit configuration"
-            )
+        if not any((Path(root) / rel).is_file() for rel in ("phpunit.xml", "phpunit.xml.dist")):
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "php: no phpunit configuration")
         return await exit_code(
             self.name,
             [phpunit, "--no-coverage", "--colors=never"],

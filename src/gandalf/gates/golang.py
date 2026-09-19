@@ -13,12 +13,16 @@ import re
 from pathlib import Path
 
 from gandalf.base import GateContext, GateOutcome, GateResult
+from gandalf.gates._toolchain import obj, objects
 from gandalf.plugins import (
     run_tool,
     timeout_result,
     tool_missing,
     unavailable,
 )
+
+# Up to this many issues is a warning; more is a failure.
+WARN_LIMIT = 3
 
 
 def _no_module(ctx: GateContext) -> bool:
@@ -34,9 +38,7 @@ class GoBuildGate:
 
     async def run(self, ctx: GateContext) -> GateResult:
         if _no_module(ctx):
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "go: no module (no go.mod)"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "go: no module (no go.mod)")
         if tool_missing("go"):
             return unavailable(self.name, "go not installed — skipped")
         rc, _out, err = await run_tool(["go", "build", "./..."], ctx.workdir)
@@ -63,28 +65,22 @@ class GolangciLintGate:
 
     async def run(self, ctx: GateContext) -> GateResult:
         if _no_module(ctx):
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "go: no module (no go.mod)"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "go: no module (no go.mod)")
         if tool_missing("golangci-lint"):
             return unavailable(self.name, "golangci-lint not installed — skipped")
-        rc, out, _ = await run_tool(
-            ["golangci-lint", "run", "--out-format", "json", "./..."], ctx.workdir
-        )
+        rc, out, _ = await run_tool(["golangci-lint", "run", "--out-format", "json", "./..."], ctx.workdir)
         if (to := timeout_result(self.name, rc)) is not None:
             return to
         try:
-            issues = json.loads(out or "{}").get("Issues") or []
+            issues = objects(obj(json.loads(out or "{}")).get("Issues"))
         except json.JSONDecodeError:
             issues = []
         n = len(issues)
         if n == 0:
             return GateResult(self.name, GateOutcome.PASS, 1.0, "golangci-lint: clean")
         score = max(0.0, 1.0 - min(n, 10) / 10)
-        outcome = GateOutcome.WARN if n <= 3 else GateOutcome.FAIL
-        return GateResult(
-            self.name, outcome, score, f"golangci-lint: {n} issue(s)", issues
-        )
+        outcome = GateOutcome.WARN if n <= WARN_LIMIT else GateOutcome.FAIL
+        return GateResult(self.name, outcome, score, f"golangci-lint: {n} issue(s)", issues)
 
     async def fix(self, ctx: GateContext) -> tuple[bool, str]:
         """`golangci-lint run --fix` — applies the fixes its linters ship
@@ -106,9 +102,7 @@ class GovulncheckGate:
 
     async def run(self, ctx: GateContext) -> GateResult:
         if _no_module(ctx):
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "go: no module (no go.mod)"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "go: no module (no go.mod)")
         if tool_missing("govulncheck"):
             return unavailable(self.name, "govulncheck not installed — skipped")
         rc, out, _ = await run_tool(["govulncheck", "./..."], ctx.workdir)
@@ -124,9 +118,7 @@ class GovulncheckGate:
             )
         score = max(0.0, 1.0 - min(n, 10) / 10)
         outcome = GateOutcome.FAIL if n >= 1 else GateOutcome.WARN
-        return GateResult(
-            self.name, outcome, score, f"govulncheck: {n} vulnerability(ies)"
-        )
+        return GateResult(self.name, outcome, score, f"govulncheck: {n} vulnerability(ies)")
 
 
 class GoTestGate:
@@ -136,9 +128,7 @@ class GoTestGate:
 
     async def run(self, ctx: GateContext) -> GateResult:
         if _no_module(ctx):
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "go: no module (no go.mod)"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "go: no module (no go.mod)")
         if tool_missing("go"):
             return unavailable(self.name, "go not installed — skipped")
         rc, out, err = await run_tool(["go", "test", "./..."], ctx.workdir)

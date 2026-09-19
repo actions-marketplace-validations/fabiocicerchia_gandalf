@@ -8,6 +8,11 @@ twenty copies of the same eight lines. So the answers live here once, and a gate
 file carries only what actually differs: the marker files, the binary, the
 command, and how to read its output.
 
+`parsed` and `scored` are the two steps *every* gate shares, ecosystem or not:
+read the tool's JSON, then turn a finding count into a score. They live here
+rather than in plugins.py because they are the gate author's vocabulary, not the
+runner's.
+
 Underscore-prefixed on purpose: plugins.discover_gates skips `_*.py`, so the base
 class here is never mistaken for a gate of its own.
 """
@@ -16,12 +21,15 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import json
 import re
 from pathlib import Path
+from typing import Any, cast
 
 from gandalf.base import GateContext, GateOutcome, GateResult
 from gandalf.plugins import (
-    _TIMEOUT_RC,
+    TIMEOUT_RC,
+    ignore_patterns,
     run_tool,
     scannable_files,
     timeout_result,
@@ -82,22 +90,147 @@ def named(ctx: GateContext, *globs: str) -> list[str]:
     raw rglob walks straight into `dist/`, `site/` and everything else git
     ignores. Tracked-and-not-excluded is the same answer every other gate gets.
     """
-    return [
-        f
-        for f in scannable_files(ctx.workdir)
-        if any(fnmatch.fnmatch(f.rsplit("/", 1)[-1], g) for g in globs)
-    ]
+    return [f for f in scannable_files(ctx.workdir) if any(fnmatch.fnmatch(f.rsplit("/", 1)[-1], g) for g in globs)]
 
 
 def tail(text: str, lines: int = 5) -> str:
     return "\n".join((text or "").strip().splitlines()[-lines:])
 
 
-def counted(
+# --- the run's one trivy scan ---------------------------------------------
+
+# `trivy fs` walks the whole repository, and two gates want what one walk
+# produces: the supply-chain gate reads the vulnerabilities, secrets and
+# misconfigurations out of it, the licensing gate reads the licences. Asking
+# twice was two walks for one set of answers — and, since dockerized tools share
+# a single cache volume, two trivy processes contending over the same
+# vulnerability database while they did it. So the scan is made once, and
+# whoever else needs it awaits that same call.
+_TRIVY_SCANNERS = "vuln,secret,misconfig,license"
+_TRIVY_SCAN: dict[str, asyncio.Future[tuple[int, str]]] = {}
+
+
+def reset_shared_scans() -> None:
+    """Forget the memoised scan.
+
+    Process state, exactly like `reset_tool_sources`: a second run in the same
+    process — the tests, an embedding host — must not be handed the first run's
+    tree.
+    """
+    _TRIVY_SCAN.clear()
+
+
+async def trivy_scan(ctx: GateContext) -> tuple[int, str]:
+    """`(rc, stdout)` of this run's `trivy fs`, running it if nobody has yet.
+
+    Whichever gate arrives first pays for it, under its own timeout; the rest
+    await the same call. That makes the budget the scan runs under depend on
+    which gate got there first, which is worth saying out loud — but it is one
+    scan's worth of budget for one scan, where before it was two gates each
+    spending their own on the same work.
+    """
+    if ctx.workdir not in _TRIVY_SCAN:
+        _TRIVY_SCAN[ctx.workdir] = asyncio.ensure_future(_trivy_fs(ctx.workdir))
+    return await _TRIVY_SCAN[ctx.workdir]
+
+
+async def _trivy_fs(workdir: str) -> tuple[int, str]:
+    """The scan itself. Every ignore goes to both `--skip-dirs` and
+    `--skip-files` (trivy takes a comma list for each) so a pattern works
+    whether it names a directory or a file."""
+    skip = ",".join(ignore_patterns(workdir))
+    rc, out, _ = await run_tool(
+        [
+            "trivy",
+            "fs",
+            "--scanners",
+            _TRIVY_SCANNERS,
+            "--format",
+            "json",
+            "--quiet",
+            "--skip-dirs",
+            skip,
+            "--skip-files",
+            skip,
+            ".",
+        ],
+        workdir,
+    )
+    return rc, out
+
+
+def merged(out: str | None, err: str | None) -> str:
+    """A tool's two streams as one text — several report on either or both."""
+    return (out or "") + (err or "")
+
+
+def nonblank(out: str | None) -> list[str]:
+    """A tool's non-blank output lines."""
+    return [ln for ln in (out or "").splitlines() if ln.strip()]
+
+
+def parsed(out: str, empty: str = "{}") -> dict[str, Any] | list[Any] | None:
+    """A tool's JSON stdout, or None when it did not emit JSON at all.
+
+    None rather than an empty document, because "the scanner printed something
+    we cannot read" is not "the scanner found nothing" — every caller turns it
+    into `unavailable`, and an empty document would score as a clean pass.
+    """
+    try:
+        return json.loads(out or empty)
+    except json.JSONDecodeError:
+        return None
+
+
+def obj(value: object) -> dict[str, Any]:
+    """`value` as a JSON object, or an empty one.
+
+    Every gate walks its tool's JSON the same way — `(data.get("x") or {})` —
+    and every one of those expressions has to answer the same question: is this
+    really an object? Asking here means a tool that answers with a list, a
+    string or null produces an empty report rather than an AttributeError
+    halfway through a scan.
+    """
+    return cast("dict[str, Any]", value) if isinstance(value, dict) else {}
+
+
+def seq(value: object) -> list[Any]:
+    """`value` as a JSON array, or an empty one. The sibling of `obj`."""
+    return cast("list[Any]", value) if isinstance(value, list) else []
+
+
+def objects(value: object) -> list[dict[str, Any]]:
+    """The JSON objects in an array, skipping anything that is not one.
+
+    A malformed entry — a bare string where a record was expected — is dropped
+    rather than reported as a finding with every field empty: a tool's output is
+    external input, and one broken entry must not sink the gate or invent a
+    finding nobody can act on.
+    """
+    return [cast("dict[str, Any]", i) for i in seq(value) if isinstance(i, dict)]
+
+
+def scored(  # noqa: PLR0913 — the parameters are the record this writes; a wrapper object here would only rename them
+    gate: str,
+    n: int,
+    summary: str,
+    findings: list[dict[str, Any]] | None = None,
+    *,
+    fail: bool,
+    cap: int = 10,
+) -> GateResult:
+    """The tail every counting gate shares: a score that bottoms out at `cap`
+    findings, and the caller's own red/amber call."""
+    score = max(0.0, 1.0 - min(n, cap) / cap)
+    outcome = GateOutcome.FAIL if fail else GateOutcome.WARN
+    return GateResult(gate, outcome, score, summary, findings or [])
+
+
+def counted(  # noqa: PLR0913 — the parameters are the record this writes; a wrapper object here would only rename them
     gate: str,
     n: int,
     label: str,
-    findings: list[dict] | None = None,
+    findings: list[dict[str, Any]] | None = None,
     *,
     warn_max: int = 3,
     noun: str = "issue(s)",
@@ -106,12 +239,11 @@ def counted(
     a handful is amber, more than that is red, and ten is as bad as it gets."""
     if n <= 0:
         return GateResult(gate, GateOutcome.PASS, 1.0, f"{label}: clean")
-    score = max(0.0, 1.0 - min(n, 10) / 10)
-    outcome = GateOutcome.WARN if n <= warn_max else GateOutcome.FAIL
-    return GateResult(gate, outcome, score, f"{label}: {n} {noun}", findings or [])
+    return scored(gate, n, f"{label}: {n} {noun}", findings, fail=n > warn_max)
 
 
-async def exit_code(
+# The parameters are the record this writes; a wrapper object here would only rename them
+async def exit_code(  # noqa: PLR0913
     gate: str,
     argv: list[str],
     cwd: str,
@@ -143,6 +275,13 @@ async def exit_code(
     )
 
 
+async def _check_one(rel: str, argv: list[str], workdir: str, limit: asyncio.Semaphore) -> tuple[str, int, str]:
+    """Run the per-file checker over one file → (path, exit code, output)."""
+    async with limit:
+        rc, out, err = await run_tool([*argv, rel], workdir)
+        return rel, rc, (out or "") + (err or "")
+
+
 async def per_file(
     gate: str,
     argv: list[str],
@@ -162,23 +301,12 @@ async def per_file(
         return GateResult(gate, GateOutcome.PASS, 1.0, f"{label}: no files in scope")
     capped = files[:MAX_SYNTAX_FILES]
     limit = asyncio.Semaphore(_PARALLEL)
-
-    async def one(rel: str) -> tuple[str, int, str]:
-        async with limit:
-            rc, out, err = await run_tool([*argv, rel], ctx.workdir)
-            return rel, rc, (out or "") + (err or "")
-
-    results = await asyncio.gather(*(one(rel) for rel in capped))
-    broken = [(rel, txt) for rel, rc, txt in results if rc not in (0, _TIMEOUT_RC)]
-    scanned = f"{len(capped)} file(s)" + (
-        f" (of {len(files)}, capped)" if len(files) > len(capped) else ""
-    )
+    results = await asyncio.gather(*(_check_one(rel, argv, ctx.workdir, limit) for rel in capped))
+    broken = [(rel, txt) for rel, rc, txt in results if rc not in (0, TIMEOUT_RC)]
+    scanned = f"{len(capped)} file(s)" + (f" (of {len(files)}, capped)" if len(files) > len(capped) else "")
     if not broken:
         return GateResult(gate, GateOutcome.PASS, 1.0, f"{label}: {scanned} parse")
-    findings = [
-        {"file": rel, "message": tail(txt, 2), "severity": "error"}
-        for rel, txt in broken[:20]
-    ]
+    findings = [{"file": rel, "message": tail(txt, 2), "severity": "error"} for rel, txt in broken[:20]]
     return GateResult(
         gate,
         GateOutcome.FAIL,

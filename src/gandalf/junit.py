@@ -10,13 +10,33 @@ set.
 
 from __future__ import annotations
 
+from typing import Any
 from xml.sax.saxutils import escape, quoteattr
 
+from . import plugins
 from .base import GateOutcome, GateResult
 from .report import fmt_finding
 
 
-def to_junit(results: list[GateResult], meta: dict | None = None) -> str:
+def _testcase(r: GateResult) -> list[str]:
+    """One <testcase> element. A FAIL carries a <failure> — that is what fails
+    the build under gandalf's default policy; a WARN with anything to say
+    carries a <system-out> instead and still passes."""
+    duration = plugins.meta(r, "duration")
+    time_attr = f' time="{duration:.3f}"' if isinstance(duration, (int, float)) else ""
+    lines = [f'  <testcase classname="gandalf" name={quoteattr(r.name)}{time_attr}>']
+    body_lines = [r.summary] if r.summary else []
+    body_lines += [fmt_finding(f) for f in r.findings]
+    body = escape("\n".join(body_lines))
+    if r.outcome == GateOutcome.FAIL:
+        lines.append(f"    <failure message={quoteattr(r.summary or r.name)}>{body}</failure>")
+    elif r.outcome == GateOutcome.WARN and body:
+        lines.append(f"    <system-out>{body}</system-out>")
+    lines.append("  </testcase>")
+    return lines
+
+
+def to_junit(results: list[GateResult], meta: dict[str, Any] | None = None) -> str:
     """Render the results as a JUnit XML suite — one test case per gate.
 
     Not because these are tests, but because every CI system already knows how
@@ -27,28 +47,9 @@ def to_junit(results: list[GateResult], meta: dict | None = None) -> str:
     failures = sum(1 for r in results if r.outcome == GateOutcome.FAIL)
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        (
-            f'<testsuite name="gandalf" tests="{len(results)}" failures="{failures}" '
-            f'errors="0" skipped="0">'
-        ),
+        (f'<testsuite name="gandalf" tests="{len(results)}" failures="{failures}" errors="0" skipped="0">'),
     ]
     for r in results:
-        duration = getattr(r, "_duration", None)
-        time_attr = (
-            f' time="{duration:.3f}"' if isinstance(duration, (int, float)) else ""
-        )
-        lines.append(
-            f'  <testcase classname="gandalf" name={quoteattr(r.name)}{time_attr}>'
-        )
-        body_lines = [r.summary] if r.summary else []
-        body_lines += [fmt_finding(f) for f in r.findings]
-        body = escape("\n".join(body_lines))
-        if r.outcome == GateOutcome.FAIL:
-            lines.append(
-                f"    <failure message={quoteattr(r.summary or r.name)}>{body}</failure>"
-            )
-        elif r.outcome == GateOutcome.WARN and body:
-            lines.append(f"    <system-out>{body}</system-out>")
-        lines.append("  </testcase>")
+        lines += _testcase(r)
     lines.append("</testsuite>")
     return "\n".join(lines)

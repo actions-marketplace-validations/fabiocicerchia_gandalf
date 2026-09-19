@@ -24,16 +24,24 @@ token and repo the caller just writes the JSON for a later CI step to post.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .report import Verdict
+
 import json
 import os
 import re
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any
 
-from .base import GateOutcome, GateResult
-from .report import fmt_finding
 from . import findings, suggest
+from .base import GateOutcome, GateResult
+from .findings import Finding
+from .report import fmt_finding
 
 # Hidden in the rendered comment; how a re-run finds what it posted last time.
 _MARKER = "<!-- gandalf-pr-review -->"
@@ -45,6 +53,10 @@ _RAG_WORD = {
 }
 
 
+# GitHub caps a review at this many inline comments per request.
+GITHUB_BATCH = 100
+
+
 def _brand() -> tuple[str, str]:
     """(icon, name) shown in the comment text. Override to rebrand without a code
     fork; the account that authors the comment is set by the token, not here."""
@@ -54,15 +66,21 @@ def _brand() -> tuple[str, str]:
     )
 
 
-def _comment_body(gate: str, f: dict) -> str:
+def _comment_body(gate: str, f: Finding, text: str) -> str:
     """Render one finding as an inline review comment.
 
     Every body opens with the marker, which is how a later run recognises its
     own comments and updates them instead of posting the same finding twice.
+
+    `text` is the *normalised* message, without the `path:line` prefix
+    `fmt_finding` puts in front: GitHub already shows the location above the
+    comment, the tool's own path is the container mount (`/src/…`) when gandalf
+    runs from the Action, and a body that spells out the line number is a body
+    that changes every time a later push shifts it — which is how one finding
+    ends up as three threads.
     """
-    rule = findings.rule(f)
-    tag = f"`{gate}`" + (f" · `{rule}`" if rule else "")
-    return f"{_MARKER}\n**{_brand()[1]}** {tag}\n\n{fmt_finding(f)}"
+    tag = f"`{gate}`" + (f" · `{rule}`" if (rule := findings.rule(f)) else "")
+    return f"{_MARKER}\n**{_brand()[1]}** {tag}\n\n{text}"
 
 
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -90,25 +108,13 @@ def added_lines(diff: str) -> dict[str, set[int]]:
     return out
 
 
-# `src/x.py:12:` at a word boundary — the shape compilers and linters print.
-_TEXT_LOC = re.compile(r"(?:^|\s)([\w./\\-]+\.\w+):(\d+)(?=[:\s]|$)")
-
-
-def _text_location(f: dict) -> tuple[str, int]:
-    """Gates that only carry the location inside their message (mypy, tsc,
-    codeql, …) would otherwise never anchor. A bogus parse costs nothing: the
-    finding just fails the added-line check and rolls up as before."""
-    hit = _TEXT_LOC.search(fmt_finding(f))
-    return (hit[1], int(hit[2])) if hit else ("", 0)
-
-
 def _comment(
     path: str,
     line: int,
-    items: list[tuple[str, dict]],
+    items: list[tuple[str, dict[str, Any]]],
     anchorable: set[int] | None,
     workdir: str,
-) -> dict:
+) -> dict[str, Any]:
     """One inline review comment: the findings on that line, plus their fix as a
     one-click ```suggestion block when the tools shipped one.
 
@@ -135,57 +141,49 @@ def build(
     changed_files: list[str] | None = None,
     diff: str = "",
     workdir: str = "",
-) -> tuple[list[dict], list[str]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     """→ (inline_comments, overflow_lines). Inline comments are anchored to a
     line the diff adds; overflow is human-readable text for the summary."""
     changed = set(changed_files or [])
     added = added_lines(diff)
     # The finding travels with its rendered body: the suggestion block is built
     # from the tool's own fix data, which only the raw finding still carries.
-    inline: dict[tuple[str, int], list[tuple[str, dict]]] = {}
+    inline: dict[tuple[str, int], list[tuple[str, dict[str, Any]]]] = {}
     overflow: list[str] = []
     for r in results:
         if r.outcome == GateOutcome.PASS:
             continue
         for f in r.findings:
-            if not isinstance(f, dict):
-                continue
-            # Scanners run in the container against /src; GitHub wants the path
-            # repo-relative, same rebase the SARIF writer does.
-            path, line = findings.relpath(findings.path(f), workdir), findings.line(f)
-            if not path or not line:
-                text_path, text_line = _text_location(f)
-                if text_path and text_line:
-                    path, line = findings.relpath(text_path, workdir), text_line
-            body = _comment_body(r.name, f)
+            # Scanners run in the container against /src; `normalise` rebases the
+            # path repo-relative (the same rebase the SARIF writer does) and
+            # recovers it from the message for the gates that carry it only there
+            # (mypy, tsc, codeql), taking it back off the message as it goes.
+            norm = findings.normalise(f, workdir)
+            path, line = norm["path"], norm["line"]
+            body = _comment_body(r.name, f, norm["message"] or fmt_finding(f))
             if added:
                 anchorable = line in added.get(path, ())
             else:
-                anchorable = (
-                    bool(path) and line > 0 and (not changed or path in changed)
-                )
+                anchorable = bool(path) and line > 0 and (not changed or path in changed)
             if anchorable:
                 inline.setdefault((path, line), []).append((body, f))
             else:
                 where = f"{path}:{line}" if path and line else (path or r.name)
-                overflow.append(
-                    f"- {_RAG_WORD[r.outcome]} `{r.name}` {where} — {fmt_finding(f)}"
-                )
-    comments = [
-        _comment(p, ln, items, added.get(p), workdir)
-        for (p, ln), items in sorted(inline.items())
-    ]
+                overflow.append(f"- {_RAG_WORD[r.outcome]} `{r.name}` {where} — {norm['message'] or fmt_finding(f)}")
+    comments = [_comment(p, ln, items, added.get(p), workdir) for (p, ln), items in sorted(inline.items())]
     return comments, overflow
 
 
-def review_payload(
+# These are the fields of the record it writes; a wrapper object would only rename them
+def review_payload(  # noqa: PLR0913
     results: list[GateResult],
-    verdict,
+    verdict: Verdict,
     changed_files: list[str] | None = None,
+    *,
     max_overflow: int = 30,
     diff: str = "",
     workdir: str = "",
-) -> dict:
+) -> dict[str, Any]:
     """Build the whole review: inline comments plus one summary body.
 
     Findings that cannot be anchored to a line in the diff go into the summary
@@ -228,7 +226,7 @@ def review_payload(
         lines += ["", "</details>"]
     if not comments and not overflow:
         lines.append("No findings. ✅")
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     lines += ["", f"<sub>Last updated {stamp}</sub>", "", _MARKER]
     # COMMENT (not REQUEST_CHANGES): GitHub forbids requesting changes on your own PR.
     return {"event": "COMMENT", "body": "\n".join(lines), "comments": comments}
@@ -241,15 +239,13 @@ def _ours(body: str | None) -> bool:
     return _MARKER in body or body.lstrip().startswith(f"**{_brand()[1]}**")
 
 
-def _api(
-    method: str, url: str, token: str, data: dict | None = None, timeout: int = 30
-) -> tuple[int, str]:
+def _api(method: str, url: str, token: str, data: dict[str, Any] | None = None, timeout: int = 30) -> tuple[int, str]:
     """One GitHub REST call, returning the status and the raw body.
 
     The status is handed back rather than raised on: several callers treat a
     404 or a 422 as an ordinary answer.
     """
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310 — URL is api.github.com, built here, not user input
         url,
         data=None if data is None else json.dumps(data).encode(),
         method=method,
@@ -260,23 +256,24 @@ def _api(
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 — fixed https GitHub API URL
+    # URL is api.github.com, built here, not user input
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 — fixed https GitHub API URL  # noqa: S310
         return resp.status, resp.read().decode(errors="replace")
 
 
-def _list_all(url: str, token: str, timeout: int) -> list[dict]:
+def _list_all(url: str, token: str, timeout: int) -> list[dict[str, Any]]:
     """Page through a GitHub list endpoint and return everything it gave.
 
     Bounded — see the note below — because an unbounded paginator on a runaway
     thread is how a review job stops finishing.
     """
     # ponytail: stops at 1000 comments; paginate properly if a PR ever gets there.
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     for page in range(1, 11):
         _, raw = _api("GET", f"{url}?per_page=100&page={page}", token, timeout=timeout)
         batch = json.loads(raw)
         out += batch
-        if len(batch) < 100:
+        if len(batch) < GITHUB_BATCH:
             break
     return out
 
@@ -309,7 +306,7 @@ query($owner:String!,$name:String!,$pr:Int!,$after:String){
 _RESOLVE = "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id}}}"
 
 
-def _graphql(query: str, variables: dict, token: str, timeout: int) -> dict:
+def _graphql(query: str, variables: dict[str, Any], token: str, timeout: int) -> dict[str, Any]:
     """One GitHub GraphQL call.
 
     Only for what REST cannot answer — resolving review threads, which has no
@@ -323,16 +320,18 @@ def _graphql(query: str, variables: dict, token: str, timeout: int) -> dict:
         timeout,
     )
     body = json.loads(raw)
-    if body.get("errors"):  # GraphQL reports failures in a 200
-        raise RuntimeError(str(body["errors"])[:200])
+    if errors := body.get("errors"):  # GraphQL reports failures in a 200
+        # The `message` is the sentence a human needs; the rest of the error
+        # object is machinery that would push it past any sane truncation.
+        raise RuntimeError("; ".join(str(e.get("message", e)) for e in errors))
     return body["data"]
 
 
-def _our_threads(repo: str, pr: int, token: str, timeout: int) -> list[dict]:
+def _our_threads(repo: str, pr: int, token: str, timeout: int) -> list[dict[str, Any]]:
     """Our review threads as {id, resolved, key} — key matching what build()
     produces, so a thread and a wanted comment compare directly."""
     owner, _, name = repo.partition("/")
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     after = None
     for _ in range(10):  # ponytail: 1000 threads is far past any real PR
         page = _graphql(
@@ -357,9 +356,18 @@ def _our_threads(repo: str, pr: int, token: str, timeout: int) -> list[dict]:
     return out
 
 
+def _why(exc: Exception) -> str:
+    """What GitHub actually said. An HTTPError's `str()` is only the status line;
+    the reason ("Resource not accessible by integration", a GraphQL error, a
+    permission the workflow never granted) is in the body."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code}: {exc.read().decode(errors='replace')[:150]}"
+    return str(exc)[:150]
+
+
 def _reconcile(
-    threads: list[dict], comments: list[dict]
-) -> tuple[list[str], list[dict]]:
+    threads: Sequence[dict[str, Any]], comments: Sequence[dict[str, Any]]
+) -> tuple[list[str], list[dict[str, Any]]]:
     """→ (thread ids to resolve, comments to post). An already-resolved thread
     counts as absent, so a finding that comes back gets a fresh comment rather
     than silently staying hidden."""
@@ -371,24 +379,27 @@ def _reconcile(
     )
 
 
-def _sync_inline(
-    repo: str, pr: int, comments: list[dict], token: str, timeout: int
-) -> str:
+def _sync_inline(repo: str, pr: int, comments: list[dict[str, Any]], token: str, timeout: int) -> str:
     """Reconcile inline comments with the PR: identical ones stay put (no reply
     thread lost, no notification), obsolete ones are *resolved* — never deleted,
     so the trail of what was flagged and any human reply survive — and new ones
     are posted."""
     api = f"https://api.github.com/repos/{repo}"
     stale, new = _reconcile(_our_threads(repo, pr, token, timeout), comments)
-    resolved, resolve_failed = 0, 0
+    resolved, refused = 0, ""
     for thread_id in stale:
         try:
             _graphql(_RESOLVE, {"id": thread_id}, token, timeout)
             resolved += 1
-        except (urllib.error.HTTPError, urllib.error.URLError, OSError, RuntimeError):
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError, RuntimeError) as exc:
             # Cosmetic: a thread left open is noise, not a reason to fail a run.
-            resolve_failed += 1
-    stuck = f", {resolve_failed} could not be resolved" if resolve_failed else ""
+            # And a refusal is about the token, not the thread — GITHUB_TOKEN is
+            # FORBIDDEN from resolveReviewThread whatever it is pointed at — so
+            # the rest of the batch would fail identically. Keep the reason, stop
+            # spending a call per thread to be told the same thing again.
+            refused = _why(exc)
+            break
+    stuck = f", {len(stale) - resolved} left open ({refused})" if refused else ""
     if not new:
         return f"{len(comments)} inline comment(s) already current, {resolved} resolved{stuck}"
     _, raw = _api("GET", f"{api}/pulls/{pr}", token, timeout=timeout)
@@ -413,9 +424,7 @@ def _sync_inline(
     return f"posted {posted} inline comment(s), {resolved} resolved{stuck}{tail}"
 
 
-def post(
-    repo: str, pr: int, payload: dict, token: str, timeout: int = 30
-) -> tuple[bool, str]:
+def post(repo: str, pr: int, payload: dict[str, Any], token: str, timeout: int = 30) -> tuple[bool, str]:
     """Publish the review, replacing what the last run posted. Returns
     (ok, message). Never raises — a failed post must not fail the gandalf run."""
     if not (repo and token):
@@ -427,10 +436,8 @@ def post(
             True,
             f"{note}; {_sync_inline(repo, pr, payload['comments'], token, timeout)}",
         )
-    except urllib.error.HTTPError as exc:
-        return (
-            False,
-            f"GitHub {exc.code}: {exc.read().decode(errors='replace')[:200]}",
-        )
-    except (urllib.error.URLError, OSError) as exc:
-        return (False, f"post failed: {exc}")
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, RuntimeError) as exc:
+        # RuntimeError included: a GraphQL error comes back inside a 200, and
+        # listing the review threads is the one call that raises it. Letting that
+        # escape would fail the run over a cosmetic step.
+        return (False, f"post failed: {_why(exc)}")

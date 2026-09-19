@@ -12,14 +12,18 @@ Each self-skips when its tool is not installed.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
+from typing import Any
 
 from gandalf.base import GateContext, GateOutcome, GateResult
 from gandalf.gates._toolchain import (
     ToolchainGate,
     counted,
     exit_code,
+    merged,
+    obj,
+    objects,
+    parsed,
     per_file,
     project_dir,
     tail,
@@ -54,6 +58,22 @@ class RubySyntaxGate(ToolchainGate):
         return await per_file(self.name, ["ruby", "-c"], ctx, (".rb",), label="ruby -c")
 
 
+def _rubocop_findings(data: object) -> list[dict[str, Any]]:
+    """rubocop's per-file offence lists, flattened."""
+    return [
+        {
+            "file": f.get("path", ""),
+            "line": obj(o.get("location")).get("line", 0),
+            "column": obj(o.get("location")).get("column", 0),
+            "rule": o.get("cop_name", ""),
+            "message": o.get("message", ""),
+            "severity": o.get("severity", ""),
+        }
+        for f in objects(obj(data).get("files"))
+        for o in objects(f.get("offenses"))
+    ]
+
+
 class RubocopGate(ToolchainGate):
     """rubocop — the de-facto Ruby linter/formatter."""
 
@@ -64,33 +84,19 @@ class RubocopGate(ToolchainGate):
     binary = "rubocop"
 
     async def check(self, ctx: GateContext, root: str) -> GateResult:
-        rc, out, err = await run_tool(
-            ["rubocop", "--format", "json", "--no-color", "--force-exclusion"], root
-        )
+        rc, out, err = await run_tool(["rubocop", "--format", "json", "--no-color", "--force-exclusion"], root)
         if (to := timeout_result(self.name, rc)) is not None:
             return to
-        try:
-            data = json.loads(out or "{}")
-        except json.JSONDecodeError:
+        data = parsed(out)
+        if data is None:
             # rubocop exits 2 and prints nothing parseable when its config is
             # broken or a required gem is absent — a tool failure, not offences.
             return unavailable(
                 self.name,
-                f"rubocop: did not run — {tail((out or '') + (err or ''), 2)}",
+                f"rubocop: did not run — {tail(merged(out, err), 2)}",
             )
-        findings = [
-            {
-                "file": f.get("path", ""),
-                "line": (o.get("location") or {}).get("line", 0),
-                "column": (o.get("location") or {}).get("column", 0),
-                "rule": o.get("cop_name", ""),
-                "message": o.get("message", ""),
-                "severity": o.get("severity", ""),
-            }
-            for f in data.get("files") or []
-            for o in f.get("offenses") or []
-        ]
-        n = (data.get("summary") or {}).get("offense_count", len(findings))
+        findings = _rubocop_findings(data)
+        n = obj(obj(data).get("summary")).get("offense_count", len(findings))
         return counted(self.name, n, "rubocop", findings[:50], noun="offence(s)")
 
     async def fix(self, ctx: GateContext) -> tuple[bool, str]:
@@ -122,13 +128,9 @@ class BundlerAuditGate(ToolchainGate):
         combined = (out or "") + (err or "")
         advisories = [ln for ln in combined.splitlines() if ln.startswith("Name: ")]
         if rc == 0:
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "bundler-audit: no known advisories"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "bundler-audit: no known advisories")
         if not advisories:
-            return unavailable(
-                self.name, f"bundler-audit: did not run — {tail(combined, 2)}"
-            )
+            return unavailable(self.name, f"bundler-audit: did not run — {tail(combined, 2)}")
         n = len(advisories)
         score = max(0.0, 1.0 - min(n, 10) / 10)
         return GateResult(
@@ -161,9 +163,7 @@ class RubyTestGate(ToolchainGate):
                 fail_re=r"^\s*\d+\)\s",
             )
         if not (Path(root) / "Rakefile").is_file():
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "ruby: no spec/ and no Rakefile"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "ruby: no spec/ and no Rakefile")
         if tool_missing("rake"):
             return self.missing("rake")
         return await exit_code(

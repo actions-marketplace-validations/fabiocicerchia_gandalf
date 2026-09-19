@@ -15,6 +15,7 @@ Or self-check the dispatch without atheris installed (CI-friendly smoke test):
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -33,6 +34,7 @@ try:
     with atheris.instrument_imports():  # type: ignore[attr-defined]  # no stubs for atheris
         from gandalf import llm, report, severity, skills, suggest, suppress
 except ImportError:
+    atheris = None
     from gandalf import llm, report, severity, skills, suggest, suppress
 
 # Exceptions each adapter is CONTRACTED to raise on bad input — expected, not a
@@ -50,9 +52,7 @@ def _exercise(text: str) -> None:
     lines = ["x = 1", text[:200], ""]
     suggest.edits(finding, lines)
     suggest.edits({"typo": text}, lines)
-    suggest.edits(
-        {"fix": {"edits": [{"content": text, "location": {"row": text[:2]}}]}}, lines
-    )
+    suggest.edits({"fix": {"edits": [{"content": text, "location": {"row": text[:2]}}]}}, lines)
     suggest.utf16_edit(text, 0, len(text), text)
 
     llm._split_sections(text)
@@ -62,15 +62,13 @@ def _exercise(text: str) -> None:
     severity.of(finding)
     severity.of({"extra": {"severity": text}})
 
-    try:
-        skills._parse_json(text)
-    except json.JSONDecodeError:
-        pass  # documented: tolerant parser still rejects non-JSON
+    # documented: the tolerant parser still rejects non-JSON
+    with contextlib.suppress(json.JSONDecodeError):
+        skills.parse_json(text)
 
-    try:
+    # malformed "gate:rule:path:line" specs are rejected, not fatal
+    with contextlib.suppress(*_EXPECTED):
         suppress._Rule(text)
-    except _EXPECTED:
-        pass  # malformed "gate:rule:path:line" specs are rejected, not fatal
 
 
 def _test_one_input(data: bytes) -> None:
@@ -95,12 +93,11 @@ def _selfcheck() -> None:
         "==>" * 5000,  # the correction scrape, with nothing to anchor it
         ":::::",
         "\x00￿\U0001f4a9",
-        "["
-        * 20000,  # over-nested JSON: json.loads raises RecursionError, not JSONDecodeError
+        "[" * 20000,  # over-nested JSON: json.loads raises RecursionError, not JSONDecodeError
     ]
     for s in seeds:
         _exercise(s)  # must not raise anything outside each adapter's contract
-    print(f"selfcheck ok: {len(seeds)} seeds")
+    print(f"selfcheck ok: {len(seeds)} seeds")  # noqa: T201 — selfcheck output, this file is a script
 
 
 def main() -> None:
@@ -108,6 +105,8 @@ def main() -> None:
         _selfcheck()
         return
 
+    if atheris is None:
+        raise SystemExit("atheris is not installed — run with --selfcheck, or pip install atheris")
     atheris.Setup(sys.argv, _test_one_input)
     atheris.Fuzz()
 

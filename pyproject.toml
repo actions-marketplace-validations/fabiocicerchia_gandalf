@@ -1,4 +1,129 @@
+[build-system]
+requires = ["setuptools>=84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gandalf"
+description = "A code-review gate that runs the tools you already have, and says what it found."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+# Deliberately none: gandalf drives tools it finds on PATH and otherwise uses
+# only the standard library, so `pipx install` pulls nothing else in.
+dependencies = []
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/fabiocicerchia/gandalf"
+
+[project.scripts]
+gandalf = "gandalf.__main__:main"
+
+[tool.setuptools.dynamic]
+# release-please stamps version.txt; the package reads it from there rather
+# than keeping a second copy in sync.
+version = { file = "version.txt" }
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The skills are data the gates read at runtime, so they ship in the wheel.
+gandalf = ["assets/**/*", "gates/**/*"]
+
 # Tooling config only — gandalf is stdlib-only, there is nothing to build/install.
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+# ---------------------------------------------------------------- Ruff (FC-PY-001)
+[tool.ruff]
+line-length = 120           # FC-GEN-045
+# The oldest Python CI tests, not the newest. There is no `requires-python`
+# to infer from (this file is tooling config; gandalf is stdlib-only and
+# installs nothing), so it is pinned by hand to ci.yml's lowest matrix leg.
+# Pinning it higher lets UP rewrite the tree into syntax that leg cannot run.
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+  "E", "W", "F", "I", "N", "UP", "ANN", "ASYNC", "S", "B", "A", "C4", "DTZ",
+  "T20", "PT", "RET", "SIM", "PTH", "ERA", "TD", "FIX", "PLR2004", "TRY", "PL", "RUF",
+]
+ignore = [
+  "ANN401",      # Any in *args/**kwargs — FC-GEN-016's comment rule covers it
+  "TRY003",      # long messages inline; FC-GEN-022 wants them descriptive
+]
+
+# An en dash is deliberate typography in this prose, not a mistyped hyphen.
+allowed-confusables = ["–", "—", "·", "×"]
+
+[tool.ruff.lint.flake8-annotations]
+mypy-init-return = true
+
+[tool.ruff.lint.per-file-ignores]
+# assert is the point; a magic number in a fixture is the fixture; "/tmp" is a
+# stand-in workdir, not a temp file; and a test that shells out to git is
+# testing the thing that shells out to git.
+"tests/**" = [
+  "S101",     # assert is the point
+  "ANN",      # a fixture's type is obvious from the fixture
+  "PLR2004",  # a magic number in a fixture is the fixture
+  "S108",     # "/tmp" here is a stand-in workdir, not a temp file
+  "S603",     # a test for the thing that shells out has to shell out
+  "S607",
+  "PLC0415",  # importing inside a test is how you patch before import
+  "S314",     # the XML is a literal in the test above it, not input
+  "ASYNC109", # a double for run_tool copies its signature, it doesn't design one
+]
+# One-off scripts: their stdout is the interface, and they drive git and node
+# by name the same way a developer would at a prompt.
+"scripts/**" = [
+  "S101",     # a benchmark's assert is its correctness check
+  "S603",     # drives git and node by name, as a developer would
+  "S607",
+  "PLC0415",  # optional imports behind a flag
+]
+
+# `X as X` is PEP 484's spelling of "this name is deliberately part of this
+# module's surface", which is what both of these import blocks are; PLC0414
+# reads it as a redundant alias.
+"src/gandalf/plugins.py" = ["PLC0414"]
+"src/gandalf/findings.py" = ["PLC0414"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
+
+# ------------------------------------------------------ Basedpyright (FC-PY-003)
+[tool.basedpyright]
+# FC-PY-003 asks for strict. The point of a type checker in CI is that it knows
+# the types: "unknown" is the finding, not a level of detail to relax away.
+typeCheckingMode = "strict"
+# ci.yml's lowest matrix leg, for the same reason ruff's target-version is.
+pythonVersion = "3.11"
+# Third-party stubs are not this repository's to ship, and a missing one is a
+# packaging fact about someone else's project rather than a defect here.
+reportMissingTypeStubs = false
+# `pythonpath = ["src"]` above is how pytest finds the package; this is the
+# same statement to the checker.
+extraPaths = ["src"]
+
+[[tool.basedpyright.executionEnvironments]]
+# The tests read module internals on purpose: half of what they assert is that
+# a private helper still behaves, which is not a claim the public API can make.
+root = "tests"
+reportPrivateUsage = false
+# An autouse fixture is called by pytest, by decoration, and never by name.
+reportUnusedFunction = false
+# Relative to the PROJECT root, not to `root` above -- "../src" pointed one
+# level outside the repository, so every `from gandalf import ...` in the
+# tests resolved to nothing and strict mode reported the fallout as ~1300
+# unknown types.
+extraPaths = ["src"]

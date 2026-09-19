@@ -8,6 +8,7 @@ file → built-in default (env still wins, for CI overrides).
     only        = ["ruff", "gitleaks"]   # allowlist: run ONLY these gates
     skip        = ["atheris"]            # denylist: never run these
     concurrency = 8                       # max gates running at once
+    deadline    = 540                     # wall-clock budget for the whole run
 
     [gandalf.verdict]
     fail_on   = "fail"    # "fail" (default) | "warn" — lowest outcome that reddens
@@ -29,10 +30,13 @@ The file is optional; with no file (or a broken one) gandalf uses its defaults.
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
-
 import tomllib
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any, cast
+
+from . import console
+from .base import Gate
 
 CONFIG_FILENAME = ".gandalf.toml"
 
@@ -41,24 +45,27 @@ class Config:
     """The `[gandalf]` table, with typed accessors. `data` is the raw table so
     later features can read their own sub-sections without touching this class."""
 
-    def __init__(self, data: dict | None = None, path: str = ""):
+    def __init__(self, data: dict[str, Any] | None = None, path: str = "") -> None:
         self.data = data or {}
         self.path = path
 
     # --- gate selection -----------------------------------------------------
     @property
     def only(self) -> set[str]:
-        return {str(x) for x in (self.data.get("only") or [])}
+        only: list[object] = self.data.get("only") or []
+        return {str(x) for x in only}
 
     @property
     def skip(self) -> set[str]:
-        return {str(x) for x in (self.data.get("skip") or [])}
+        skip: list[object] = self.data.get("skip") or []
+        return {str(x) for x in skip}
 
-    def select(self, gates: list) -> tuple[list, list[str]]:
+    def select(self, gates: Sequence[Gate]) -> tuple[list[Gate], list[str]]:
         """Apply only/skip. Returns (kept_gates, disabled_names). `only` is an
         allowlist (empty = allow all); `skip` always removes."""
         only, skip = self.only, self.skip
-        kept, disabled = [], []
+        kept: list[Gate] = []
+        disabled: list[str] = []
         for g in gates:
             if (only and g.name not in only) or g.name in skip:
                 disabled.append(g.name)
@@ -68,16 +75,23 @@ class Config:
 
     @property
     def concurrency(self) -> int | None:
-        v = self.data.get("concurrency")
+        return self._int("concurrency")
+
+    @property
+    def deadline(self) -> int | None:
+        return self._int("deadline")
+
+    def _int(self, key: str) -> int | None:
+        v = self.data.get(key)
         try:
             return int(v) if v is not None else None
         except (TypeError, ValueError):
             return None
 
     # --- sub-sections (used by later features) ------------------------------
-    def section(self, name: str) -> dict:
-        v = self.data.get(name)
-        return v if isinstance(v, dict) else {}
+    def section(self, name: str) -> dict[str, Any]:
+        v: object = self.data.get(name)
+        return cast("dict[str, Any]", v) if isinstance(v, dict) else {}
 
 
 def load(repo_root: str | None = None, explicit: str | None = None) -> Config:
@@ -91,10 +105,10 @@ def load(repo_root: str | None = None, explicit: str | None = None) -> Config:
     if not path or not Path(path).is_file():
         return Config()
     try:
-        with open(path, "rb") as fh:
+        with Path(path).open("rb") as fh:
             raw = tomllib.load(fh)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         # A broken config must never sink the run — warn and fall back to defaults.
-        print(f"gandalf: ignoring config {path}: {exc}", file=sys.stderr)
+        console.err(f"gandalf: ignoring config {path}: {exc}")
         return Config()
     return Config(raw.get("gandalf", {}) or {}, path)

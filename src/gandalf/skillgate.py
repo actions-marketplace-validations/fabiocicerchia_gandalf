@@ -20,18 +20,21 @@ from __future__ import annotations
 import asyncio
 from functools import cache
 from pathlib import Path
+from typing import Any, cast
 
 from gandalf.base import GateContext, GateOutcome, GateResult
+from gandalf.findings import Finding
+from gandalf.gates._toolchain import seq
 from gandalf.plugins import unavailable
 
 # One tolerant JSON parser for every LLM-judge gate; it hardens json.loads so
 # over-nested replies surface as JSONDecodeError instead of leaking RecursionError.
-from gandalf.skills import _parse_json as parse_json
+from gandalf.skills import parse_json
 
-# skills/ sits at the repo root, above the src/gandalf/ package; resolve relative
-# to this package so a gate reads the same file a human would `/`-invoke, wherever
-# gandalf runs from (working tree, staged, or a throwaway --commit worktree).
-SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
+# The skills ship inside the package, so a gate reads the same file a human
+# would `/`-invoke, wherever gandalf runs from -- working tree, staged, a
+# throwaway --commit worktree, or an installed wheel with no checkout at all.
+SKILLS_DIR = Path(__file__).resolve().parent / "assets"
 
 _DIFF_LIMIT = 20_000
 _FILE_LIMIT = 8_000  # per changed file
@@ -54,7 +57,7 @@ def _rubric(slugs: tuple[str, ...]) -> str:
     """Concatenate the named skills into one rubric block. The first slug is the
     gate's skill; the rest are its embedded dependencies (e.g. grill-me → grilling,
     improve-codebase-architecture → codebase-design)."""
-    parts = []
+    parts: list[str] = []
     for slug in slugs:
         text = load_skill(slug)
         if text:
@@ -83,32 +86,33 @@ def _changed_file_contents(ctx: GateContext) -> str:
     return "\n\n".join(out)
 
 
-def _normalize_findings(raw) -> list[dict]:
+def _alias(item: Finding, *keys: str) -> str:
+    """The first non-empty value among the names a model might have used for the
+    same field. '' when it used none of them."""
+    for k in keys:
+        v = item.get(k)
+        if v:
+            return str(v).strip()
+    return ""
+
+
+def _normalize_findings(raw: object) -> list[dict[str, Any]]:
     """Coerce the model's findings into dicts whose keys report.fmt_finding
     already understands (``file`` / ``finding`` / ``description``)."""
-    findings: list[dict] = []
-    for item in (raw or [])[:_MAX_FINDINGS]:
+    findings: list[dict[str, Any]] = []
+    for item in seq(raw)[:_MAX_FINDINGS]:
         if isinstance(item, str):
             findings.append({"finding": item.strip()})
             continue
         if not isinstance(item, dict):
             continue
-        sev = str(item.get("severity") or item.get("risk") or "").strip().lower()
+        record = cast("Finding", item)
         findings.append(
             {
-                "severity": sev,
-                "finding": str(
-                    item.get("title") or item.get("finding") or item.get("issue") or ""
-                ).strip(),
-                "description": str(
-                    item.get("detail")
-                    or item.get("description")
-                    or item.get("recommendation")
-                    or ""
-                ).strip(),
-                "file": str(
-                    item.get("location") or item.get("file") or item.get("module") or ""
-                ).strip(),
+                "severity": _alias(record, "severity", "risk").lower(),
+                "finding": _alias(record, "title", "finding", "issue"),
+                "description": _alias(record, "detail", "description", "recommendation"),
+                "file": _alias(record, "location", "file", "module"),
             }
         )
     return [f for f in findings if f.get("finding") or f.get("description")]
@@ -126,6 +130,7 @@ class SkillGate:
 
     name: str = ""  # set by each subclass
     blocking = False
+    uses_llm = True  # --no-llm drops the gate, not just the summary
     skills: tuple[str, ...] = ()
     task = ""
     pass_threshold = 0.75
@@ -133,7 +138,7 @@ class SkillGate:
     unit = "issue"  # what a finding is called in the summary line
 
     async def run(self, ctx: GateContext) -> GateResult:
-        from gandalf import llm
+        from gandalf import llm  # noqa: PLC0415 — local import: importing at module scope closes a cycle
 
         rubric = _rubric(self.skills)
         if not rubric:
@@ -148,27 +153,33 @@ class SkillGate:
         diff = (meta.get("diff") or "").strip()
         files = _changed_file_contents(ctx)
 
+        if refusal := self._nothing_to_judge(title, body, diff, files):
+            return refusal
+
+        prompt = self._prompt(rubric, title, body, diff=diff, files=files, ctx=ctx)
+        try:
+            text = await asyncio.to_thread(llm.chat, [{"role": "user", "content": prompt}], temperature=0.0)
+            data = parse_json(text)
+        except Exception as exc:
+            return unavailable(self.name, f"{self.name}: judge unavailable ({str(exc)[:70]}) — skipped")
+        return self._verdict(data)
+
+    def _nothing_to_judge(self, title: str, body: str, diff: str, files: str) -> GateResult | None:
+        """The gate's own refusals, before a token is spent: no plan when the
+        skill needs one, or nothing in scope at all."""
         if self.needs_request and not (title or body):
             return unavailable(
                 self.name,
                 f"{self.name}: no plan to judge — pass --title/--body describing the intent",
             )
         if not (diff or files or title or body):
-            return unavailable(
-                self.name, f"{self.name}: nothing in scope to judge — skipped"
-            )
+            return unavailable(self.name, f"{self.name}: nothing in scope to judge — skipped")
+        return None
 
-        prompt = self._prompt(rubric, title, body, diff, files, ctx)
-        try:
-            text = await asyncio.to_thread(
-                llm.chat, [{"role": "user", "content": prompt}], temperature=0.0
-            )
-            data = parse_json(text)
-        except Exception as exc:  # noqa: BLE001 — never crash or false-pass the run
-            return unavailable(
-                self.name, f"{self.name}: judge unavailable ({str(exc)[:70]}) — skipped"
-            )
-
+    def _verdict(self, data: dict[str, Any]) -> GateResult:
+        """The judge's JSON as a gate result. A score that will not parse is 0,
+        never a pass — the gate must not go green because the model went off
+        format."""
         try:
             pct = max(0, min(100, round(float(data.get("score", 0)))))
         except (TypeError, ValueError):
@@ -179,25 +190,23 @@ class SkillGate:
 
         outcome = GateOutcome.PASS if score >= self.pass_threshold else GateOutcome.WARN
         n = len(findings)
-        summary = f"{pct}/100" + (
-            f" · {n} {self.unit}{'s' if n != 1 else ''}" if n else " · clean"
-        )
+        summary = f"{pct}/100" + (f" · {n} {self.unit}{'s' if n != 1 else ''}" if n else " · clean")
         if judge_summary:
             findings = [*findings, {"judge_summary": judge_summary}]
         return GateResult(self.name, outcome, score, summary, findings)
 
-    def _prompt(
+    # These are the fields of the record it writes; a wrapper object would only rename them
+    def _prompt(  # noqa: PLR0913
         self,
         rubric: str,
         title: str,
         body: str,
+        *,
         diff: str,
         files: str,
         ctx: GateContext,
     ) -> str:
-        diff_trunc = diff[:_DIFF_LIMIT] + (
-            "\n…[diff truncated]" if len(diff) > _DIFF_LIMIT else ""
-        )
+        diff_trunc = diff[:_DIFF_LIMIT] + ("\n…[diff truncated]" if len(diff) > _DIFF_LIMIT else "")
         langs = ", ".join((ctx.meta or {}).get("languages") or []) or "unknown"
         request = (
             f"Title: {title}\n\n{body}".strip()

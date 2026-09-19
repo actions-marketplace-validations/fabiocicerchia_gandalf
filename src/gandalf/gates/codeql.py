@@ -30,18 +30,19 @@ import json
 import os
 import shutil
 import tempfile
+from pathlib import Path
+from typing import Any
 
 from gandalf.base import GateContext, GateOutcome, GateResult
+from gandalf.gates._toolchain import obj, objects, scored
 from gandalf.plugins import (
     run_tool,
     timeout_result,
     unavailable,
 )
-from gandalf.scope import _classify
+from gandalf.scope import classify
 
-_IMAGE = os.environ.get(
-    "GANDALF_CODEQL_IMAGE", "mcr.microsoft.com/cstsectools/codeql-container:latest"
-)
+_IMAGE = os.environ.get("GANDALF_CODEQL_IMAGE", "mcr.microsoft.com/cstsectools/codeql-container:latest")
 _TIMEOUT = int(os.environ.get("GANDALF_CODEQL_TIMEOUT", "600"))
 
 # gandalf language tag → CodeQL language id. node and ts both map to "javascript"
@@ -54,6 +55,21 @@ _LANG_MAP = {
 }
 
 
+# More than a handful of alerts is a failure, not a warning.
+MAX_ALERTS = 5
+
+
+def _codeql_langs(changed_files: list[str] | None) -> list[str]:
+    """The CodeQL language ids to analyze.
+
+    Whole-tree scope classifies to nothing, so fall back to the languages CodeQL
+    can build here (all of them) — the per-language create simply produces an
+    empty DB for a language with no sources.
+    """
+    detected = classify(changed_files) if changed_files else None
+    return sorted({_LANG_MAP[t] for t in (detected or set(_LANG_MAP)) if t in _LANG_MAP})
+
+
 class CodeqlGate:
     name = "codeql"
     blocking = False
@@ -62,17 +78,9 @@ class CodeqlGate:
     async def run(self, ctx: GateContext) -> GateResult:
         have_host = shutil.which("codeql") is not None
         if not have_host and not shutil.which("docker"):
-            return unavailable(
-                self.name, "codeql unavailable (no host binary and no docker) — skipped"
-            )
+            return unavailable(self.name, "codeql unavailable (no host binary and no docker) — skipped")
 
-        detected = _classify(ctx.changed_files) if ctx.changed_files else None
-        # Whole-tree scope: _classify of changed_files is empty, so fall back to the
-        # languages CodeQL can build here (all of them) — the per-language create
-        # simply produces an empty DB for a language with no sources.
-        cq_langs = sorted(
-            {_LANG_MAP[t] for t in (detected or set(_LANG_MAP)) if t in _LANG_MAP}
-        )
+        cq_langs = _codeql_langs(ctx.changed_files)
         if not cq_langs:
             return GateResult(
                 self.name,
@@ -82,26 +90,8 @@ class CodeqlGate:
             )
 
         work = tempfile.mkdtemp(prefix="gandalf-codeql-")
-        ran: list[str] = []  # languages that produced a SARIF we could read
-        findings: list[dict] = []
-        errors = warnings = 0
         try:
-            for lang in cq_langs:
-                sarif = os.path.join(work, f"{lang}.sarif")
-                if not await self._analyze(ctx, work, lang, sarif, have_host):
-                    continue
-                try:
-                    # Small local SARIF read right after the subprocess
-                    # completes — not worth a thread hop.
-                    with open(sarif, errors="replace") as fh:  # noqa: ASYNC230
-                        data = json.load(fh)
-                except (OSError, json.JSONDecodeError):
-                    continue
-                ran.append(lang)
-                e, w, f = _parse_sarif(data)
-                errors += e
-                warnings += w
-                findings.extend(f)
+            ran, errors, warnings, findings = await self._collect(ctx, work, cq_langs, have_host)
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -114,25 +104,46 @@ class CodeqlGate:
         n = errors + warnings
         langs_txt = "+".join(ran)
         if n == 0:
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, f"codeql ({langs_txt}): clean"
-            )
-        score = max(0.0, 1.0 - min(n, 10) / 10)
-        outcome = GateOutcome.FAIL if errors > 0 or n > 5 else GateOutcome.WARN
-        return GateResult(
+            return GateResult(self.name, GateOutcome.PASS, 1.0, f"codeql ({langs_txt}): clean")
+        return scored(
             self.name,
-            outcome,
-            score,
+            n,
             f"codeql ({langs_txt}): {errors} error, {warnings} warning finding(s)",
             findings[:100],
+            fail=errors > 0 or n > MAX_ALERTS,
         )
 
-    async def _analyze(
-        self, ctx: GateContext, work: str, lang: str, sarif: str, have_host: bool
-    ) -> bool:
+    async def _collect(
+        self, ctx: GateContext, work: str, cq_langs: list[str], have_host: bool
+    ) -> tuple[list[str], int, int, list[dict[str, Any]]]:
+        """Analyze each language in turn → (languages that produced a SARIF we
+        could read, error count, warning count, findings)."""
+        ran: list[str] = []
+        findings: list[dict[str, Any]] = []
+        errors = warnings = 0
+        for lang in cq_langs:
+            sarif = str(Path(work) / f"{lang}.sarif")
+            if not await self._analyze(ctx, work, lang, sarif, have_host):
+                continue
+            try:
+                # Small local SARIF read right after the subprocess completes —
+                # not worth a thread hop.
+                # A small local file, read once the subprocess has finished
+                with Path(sarif).open(errors="replace") as fh:  # noqa: ASYNC230
+                    data = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            ran.append(lang)
+            e, w, f = _parse_sarif(data)
+            errors += e
+            warnings += w
+            findings.extend(f)
+        return ran, errors, warnings, findings
+
+    async def _analyze(self, ctx: GateContext, work: str, lang: str, sarif: str, have_host: bool) -> bool:
         """Create a DB and run the `<lang>-queries` code-scanning pack, writing SARIF
         to `sarif`. Returns True iff both steps succeeded (SARIF should now exist)."""
-        db = os.path.join(work, f"db-{lang}")
+        db = str(Path(work) / f"db-{lang}")
         pack = f"codeql/{lang}-queries"
         if have_host:
             create = [
@@ -173,9 +184,11 @@ class CodeqlGate:
                 "--network",
                 "host",
                 "-v",
-                f"{os.path.abspath(ctx.workdir)}:/src",
+                # One stat, straight after a subprocess that took seconds — not worth a thread hop
+                f"{Path(ctx.workdir).resolve()}:/src",  # noqa: ASYNC240
                 "-v",
-                f"{os.path.abspath(work)}:/work",
+                # One stat, straight after a subprocess that took seconds — not worth a thread hop
+                f"{Path(work).resolve()}:/work",  # noqa: ASYNC240
                 "-w",
                 "/src",
                 _IMAGE,
@@ -214,16 +227,17 @@ class CodeqlGate:
         rc, _o, _e = await run_tool(analyze, ctx.workdir, _TIMEOUT)
         if rc != 0 or timeout_result(self.name, rc) is not None:
             return False
-        return os.path.exists(sarif)
+        # One stat, straight after a subprocess that took seconds — not worth a thread hop
+        return Path(sarif).exists()  # noqa: ASYNC240
 
 
-def _parse_sarif(data: dict) -> tuple[int, int, list[dict]]:
+def _parse_sarif(data: dict[str, Any]) -> tuple[int, int, list[dict[str, Any]]]:
     """Pull (error-count, warning-count, findings) out of a SARIF 2.x document.
     `note`-level results are informational and don't count toward the score."""
     errors = warnings = 0
-    findings: list[dict] = []
-    for run in data.get("runs", []) or []:
-        for res in run.get("results", []) or []:
+    findings: list[dict[str, Any]] = []
+    for run in objects(obj(data).get("runs")):
+        for res in objects(run.get("results")):
             level = res.get("level", "warning")
             if level == "error":
                 errors += 1
@@ -231,14 +245,14 @@ def _parse_sarif(data: dict) -> tuple[int, int, list[dict]]:
                 pass
             else:
                 warnings += 1
-            loc = (res.get("locations") or [{}])[0]
-            phys = loc.get("physicalLocation", {}) or {}
+            locations = objects(res.get("locations"))
+            phys = obj(locations[0].get("physicalLocation") if locations else None)
             findings.append(
                 {
-                    "file": phys.get("artifactLocation", {}).get("uri", ""),
-                    "line": phys.get("region", {}).get("startLine", ""),
+                    "file": obj(phys.get("artifactLocation")).get("uri", ""),
+                    "line": obj(phys.get("region")).get("startLine", ""),
                     "rule": res.get("ruleId", ""),
-                    "message": f"[{level}] {res.get('message', {}).get('text', '')}",
+                    "message": f"[{level}] {obj(res.get('message')).get('text', '')}",
                 }
             )
     return errors, warnings, findings

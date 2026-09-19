@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from gandalf import suggest
 from gandalf.base import GateContext, GateOutcome, GateResult
 from gandalf.findings import relpath
+from gandalf.gates._toolchain import merged, obj, objects, parsed, scored, seq
 from gandalf.plugins import (
     run_tool,
     timeout_result,
@@ -21,47 +23,69 @@ from gandalf.plugins import (
     unavailable,
 )
 
+# ESLint reports severity 2 for an error and 1 for a warning.
+ESLINT_ERROR = 2
+# A source range is a [start, end] pair.
+RANGE_PAIR = 2
+# More than this many lint issues fails the gate.
+MAX_ISSUES = 10
+
 
 def _no_pkg(ctx: GateContext) -> bool:
     return not (Path(ctx.workdir) / "package.json").exists()
 
 
-def _messages(results: list, workdir: str) -> list[dict]:
-    """eslint's per-message findings, flattened to the keys the report, SARIF
-    and the PR comments all read — and, for a rule eslint knows how to fix, a
-    `_fix` block so the pull request can carry the fix as a suggestion.
+def _item(m: dict[str, Any], rel: str) -> dict[str, Any]:
+    """One eslint message, in the keys the report, SARIF and the PR comments
+    all read."""
+    return {
+        "path": rel,
+        "line": m.get("line") or 0,
+        "column": m.get("column") or 0,
+        "rule_id": m.get("ruleId") or "eslint",
+        "message": m.get("message", ""),
+        "severity": "error" if m.get("severity") == ESLINT_ERROR else "warning",
+    }
+
+
+def _fix_range(m: dict[str, Any]) -> list[Any] | None:
+    """The character-offset span of the rule's own autofix, when it has one."""
+    rng = seq(obj(m.get("fix")).get("range"))
+    return rng if len(rng) == RANGE_PAIR else None
+
+
+def _messages(results: list[dict[str, Any]], workdir: str) -> list[dict[str, Any]]:
+    """eslint's per-message findings, flattened — and, for a rule eslint knows
+    how to fix, a `_fix` block so the pull request can carry the fix as a
+    suggestion.
 
     eslint reports a fix as a pair of character offsets into the file. Nothing
     downstream speaks offsets, so the translation happens here, once, where the
     file that produced them is at hand.
     """
-    out: list[dict] = []
-    for res in results:
-        if not isinstance(res, dict):
-            continue
+    out: list[dict[str, Any]] = []
+    for res in objects(results):
         rel = relpath(res.get("filePath", ""), workdir)
         source: str | None = None
-        for m in res.get("messages") or []:
-            if not isinstance(m, dict):
-                continue
-            item = {
-                "path": rel,
-                "line": m.get("line") or 0,
-                "column": m.get("column") or 0,
-                "rule_id": m.get("ruleId") or "eslint",
-                "message": m.get("message", ""),
-                "severity": "error" if m.get("severity") == 2 else "warning",
-            }
-            fix = m.get("fix") if isinstance(m.get("fix"), dict) else {}
-            rng = fix.get("range")
-            if isinstance(rng, list) and len(rng) == 2:
+        for m in objects(res.get("messages")):
+            item = _item(m, rel)
+            rng = _fix_range(m)
+            if rng:
                 if source is None:  # read once per file, only if a fix needs it
                     source = _read(workdir, rel)
-                edit = suggest.utf16_edit(source, rng[0], rng[1], fix.get("text"))
+                edit = suggest.utf16_edit(source, rng[0], rng[1], obj(m.get("fix")).get("text"))
                 if edit:
                     item["_fix"] = {"edits": [edit]}
             out.append(item)
     return out
+
+
+def _eslint_counts(results: list[dict[str, Any]]) -> tuple[int, int]:
+    """(errors, warnings) across eslint's per-file results."""
+    return (
+        sum(r.get("errorCount", 0) for r in results),
+        sum(r.get("warningCount", 0) for r in results),
+    )
 
 
 def _read(workdir: str, rel: str) -> str:
@@ -76,38 +100,31 @@ class EslintGate:
     blocking = False
     langs = frozenset({"node", "ts"})
 
-    async def run(self, ctx: GateContext) -> GateResult:
+    # One early return per failure mode: fail fast (FC-GEN-019) reads better than one exit
+    async def run(self, ctx: GateContext) -> GateResult:  # noqa: PLR0911
         if _no_pkg(ctx):
             return GateResult(self.name, GateOutcome.PASS, 1.0, "node: no package.json")
         if tool_missing("npx"):
             return unavailable(self.name, "npx/node not installed — skipped")
-        rc, out, _err = await run_tool(
-            ["npx", "--no-install", "eslint", "-f", "json", "."], ctx.workdir
-        )
+        rc, out, _err = await run_tool(["npx", "--no-install", "eslint", "-f", "json", "."], ctx.workdir)
         if (to := timeout_result(self.name, rc)) is not None:
             return to
         if not (out or "").strip():
             # npx --no-install printed nothing → eslint isn't installed in the project.
-            return unavailable(
-                self.name, "eslint: not installed in project (npm i eslint) — skipped"
-            )
-        try:
-            results = json.loads(out)
-        except json.JSONDecodeError:
+            return unavailable(self.name, "eslint: not installed in project (npm i eslint) — skipped")
+        results = parsed(out, "")
+        if results is None:
             return unavailable(self.name, "eslint: not configured in project — skipped")
-        errors = sum(r.get("errorCount", 0) for r in results)
-        warns = sum(r.get("warningCount", 0) for r in results)
+        errors, warns = _eslint_counts(objects(results))
         total = errors + warns
         if total == 0:
             return GateResult(self.name, GateOutcome.PASS, 1.0, "eslint: clean")
-        score = max(0.0, 1.0 - min(total, 10) / 10)
-        outcome = GateOutcome.FAIL if errors > 0 else GateOutcome.WARN
-        return GateResult(
+        return scored(
             self.name,
-            outcome,
-            score,
+            total,
             f"eslint: {errors} error(s), {warns} warning(s)",
-            _messages(results, ctx.workdir),
+            _messages(objects(results), ctx.workdir),
+            fail=errors > 0,
         )
 
     async def fix(self, ctx: GateContext) -> tuple[bool, str]:
@@ -132,12 +149,10 @@ class TscGate:
             return GateResult(self.name, GateOutcome.PASS, 1.0, "tsc: no tsconfig.json")
         if tool_missing("npx"):
             return unavailable(self.name, "npx/node not installed — skipped")
-        rc, out, err = await run_tool(
-            ["npx", "--no-install", "tsc", "--noEmit"], ctx.workdir
-        )
+        rc, out, err = await run_tool(["npx", "--no-install", "tsc", "--noEmit"], ctx.workdir)
         if (to := timeout_result(self.name, rc)) is not None:
             return to
-        combined = (out or "") + (err or "")
+        combined = merged(out, err)
         n = combined.count("error TS")
         if rc == 0:
             return GateResult(self.name, GateOutcome.PASS, 1.0, "tsc: no type errors")
@@ -147,11 +162,14 @@ class TscGate:
                 self.name,
                 "tsc: could not run (not installed or misconfigured) — skipped",
             )
-        score = max(0.0, 1.0 - min(n, 20) / 20)
-        outcome = GateOutcome.FAIL if n > 10 else GateOutcome.WARN
         tail = "\n".join(ln for ln in combined.splitlines() if "error TS" in ln)[:1000]
-        return GateResult(
-            self.name, outcome, score, f"tsc: {n} type error(s)", [{"errors": tail}]
+        return scored(
+            self.name,
+            n,
+            f"tsc: {n} type error(s)",
+            [{"errors": tail}],
+            fail=n > MAX_ISSUES,
+            cap=20,
         )
 
 
@@ -178,6 +196,4 @@ class NodeTestGate:
         if rc == 0:
             return GateResult(self.name, GateOutcome.PASS, 1.0, "npm test: passed")
         tail = "\n".join(((out or "") + (err or "")).strip().splitlines()[-5:])
-        return GateResult(
-            self.name, GateOutcome.FAIL, 0.0, f"npm test: failed — {tail}"
-        )
+        return GateResult(self.name, GateOutcome.FAIL, 0.0, f"npm test: failed — {tail}")

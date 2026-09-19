@@ -4,16 +4,19 @@ from __future__ import annotations
 
 from gandalf.base import GateContext, GateOutcome, GateResult
 from gandalf.plugins import (
-    _scan_targets,
     missing_result,
     run_tool,
+    scan_targets,
     timeout_result,
     tool_missing,
 )
 
+# More than this many issues fails rather than warns.
+MAX_ISSUES = 10
+
 
 def _has_python(ctx: GateContext) -> bool:
-    return any(t == "." or t.endswith(".py") for t in _scan_targets(ctx, py_only=True))
+    return any(t == "." or t.endswith(".py") for t in scan_targets(ctx, py_only=True))
 
 
 class MypyGate:
@@ -36,7 +39,7 @@ class MypyGate:
                 # Don't drop a .mypy_cache into the scanned repo (matches ruff's
                 # --no-cache); also avoids a stale root-owned cache breaking reruns.
                 "--cache-dir=/dev/null",
-                *_scan_targets(ctx, py_only=True),
+                *scan_targets(ctx, py_only=True),
             ],
             ctx.workdir,
         )
@@ -47,7 +50,7 @@ class MypyGate:
         if n == 0:
             return GateResult(self.name, GateOutcome.PASS, 1.0, "mypy: no type errors")
         score = max(0.0, 1.0 - min(n, 20) / 20)
-        outcome = GateOutcome.FAIL if n > 10 else GateOutcome.WARN
+        outcome = GateOutcome.FAIL if n > MAX_ISSUES else GateOutcome.WARN
         return GateResult(
             self.name,
             outcome,
@@ -66,11 +69,9 @@ class VultureGate:
         if (m := missing_result(self.name, "vulture")) is not None:
             return m
         if not _has_python(ctx):
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "vulture: no Python files"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "vulture: no Python files")
         rc, out, _ = await run_tool(
-            ["vulture", "--min-confidence", "80", *_scan_targets(ctx, py_only=True)],
+            ["vulture", "--min-confidence", "80", *scan_targets(ctx, py_only=True)],
             ctx.workdir,
         )
         if (to := timeout_result(self.name, rc)) is not None:
@@ -101,28 +102,22 @@ class FormatGate:
         if (m := missing_result(self.name, "ruff")) is not None:
             return m
         if not _has_python(ctx):
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "format: no Python files"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "format: no Python files")
         rc, out, _ = await run_tool(
             [
                 "ruff",
                 "format",
                 "--no-cache",
                 "--check",
-                *_scan_targets(ctx, py_only=True),
+                *scan_targets(ctx, py_only=True),
             ],
             ctx.workdir,
         )
         if (to := timeout_result(self.name, rc)) is not None:
             return to
-        drift = [
-            ln for ln in (out or "").splitlines() if ln.startswith("Would reformat")
-        ]
+        drift = [ln for ln in (out or "").splitlines() if ln.startswith("Would reformat")]
         if rc == 0 or not drift:
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "format: all files formatted"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "format: all files formatted")
         n = len(drift)
         score = max(0.0, 1.0 - min(n, 10) / 10)
         return GateResult(
@@ -138,7 +133,7 @@ class FormatGate:
         if tool_missing("ruff"):
             return (False, "ruff unavailable — nothing formatted")
         _rc, out, err = await run_tool(
-            ["ruff", "format", "--no-cache", *_scan_targets(ctx, py_only=True)],
+            ["ruff", "format", "--no-cache", *scan_targets(ctx, py_only=True)],
             ctx.workdir,
         )
         line = next(

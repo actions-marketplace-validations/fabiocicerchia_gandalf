@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 
 from gandalf.base import GateContext, GateOutcome, GateResult
+from gandalf.gates._toolchain import merged, parsed, scored
 from gandalf.plugins import (
     run_tool,
     timeout_result,
@@ -19,9 +20,25 @@ from gandalf.plugins import (
     unavailable,
 )
 
+# More than a few clippy issues fails the gate.
+MAX_ISSUES = 3
+
 
 def _no_crate(ctx: GateContext) -> bool:
     return not (Path(ctx.workdir) / "Cargo.toml").exists()
+
+
+def _clippy_diagnostics(text: str) -> int:
+    """clippy's warning/error diagnostics in its JSON-lines output. A line that
+    is not JSON is cargo's own progress chatter, not a diagnostic."""
+    n = 0
+    for line in text.splitlines():
+        msg = parsed(line)
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("reason") == "compiler-message" and msg.get("message", {}).get("level") in ("warning", "error"):
+            n += 1
+    return n
 
 
 class RustBuildGate:
@@ -33,9 +50,7 @@ class RustBuildGate:
 
     async def run(self, ctx: GateContext) -> GateResult:
         if _no_crate(ctx):
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "rust: no crate (no Cargo.toml)"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "rust: no crate (no Cargo.toml)")
         if tool_missing("cargo"):
             return unavailable(self.name, "cargo not installed — skipped")
         rc, _out, err = await run_tool(["cargo", "build"], ctx.workdir)
@@ -62,32 +77,16 @@ class ClippyGate:
 
     async def run(self, ctx: GateContext) -> GateResult:
         if _no_crate(ctx):
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "rust: no crate (no Cargo.toml)"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "rust: no crate (no Cargo.toml)")
         if tool_missing("cargo"):
             return unavailable(self.name, "cargo not installed — skipped")
-        rc, _out, err = await run_tool(
-            ["cargo", "clippy", "--message-format=json"], ctx.workdir
-        )
+        rc, _out, err = await run_tool(["cargo", "clippy", "--message-format=json"], ctx.workdir)
         if (to := timeout_result(self.name, rc)) is not None:
             return to
-        combined = (_out or "") + (err or "")
-        n = 0
-        for line in combined.splitlines():
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if msg.get("reason") == "compiler-message" and (
-                msg.get("message", {}).get("level") in ("warning", "error")
-            ):
-                n += 1
+        n = _clippy_diagnostics(merged(_out, err))
         if n == 0:
             return GateResult(self.name, GateOutcome.PASS, 1.0, "clippy: clean")
-        score = max(0.0, 1.0 - min(n, 10) / 10)
-        outcome = GateOutcome.WARN if n <= 3 else GateOutcome.FAIL
-        return GateResult(self.name, outcome, score, f"clippy: {n} issue(s)")
+        return scored(self.name, n, f"clippy: {n} issue(s)", fail=n > MAX_ISSUES)
 
     async def fix(self, ctx: GateContext) -> tuple[bool, str]:
         """`cargo clippy --fix` — applies the machine-applicable lints. Called
@@ -124,9 +123,7 @@ class CargoAuditGate:
 
     async def run(self, ctx: GateContext) -> GateResult:
         if _no_crate(ctx):
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "rust: no crate (no Cargo.toml)"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "rust: no crate (no Cargo.toml)")
         if tool_missing("cargo-audit"):
             return unavailable(self.name, "cargo-audit not installed — skipped")
         rc, out, _err = await run_tool(["cargo", "audit", "--json"], ctx.workdir)
@@ -145,9 +142,7 @@ class CargoAuditGate:
                 "cargo-audit: no known vulnerabilities",
             )
         score = max(0.0, 1.0 - min(n, 10) / 10)
-        return GateResult(
-            self.name, GateOutcome.FAIL, score, f"cargo-audit: {n} vulnerability(ies)"
-        )
+        return GateResult(self.name, GateOutcome.FAIL, score, f"cargo-audit: {n} vulnerability(ies)")
 
 
 class RustTestGate:
@@ -157,9 +152,7 @@ class RustTestGate:
 
     async def run(self, ctx: GateContext) -> GateResult:
         if _no_crate(ctx):
-            return GateResult(
-                self.name, GateOutcome.PASS, 1.0, "rust: no crate (no Cargo.toml)"
-            )
+            return GateResult(self.name, GateOutcome.PASS, 1.0, "rust: no crate (no Cargo.toml)")
         if tool_missing("cargo"):
             return unavailable(self.name, "cargo not installed — skipped")
         rc, out, err = await run_tool(["cargo", "test"], ctx.workdir)

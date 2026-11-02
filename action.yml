@@ -111,7 +111,7 @@ runs:
     - name: Mint GitHub App token
       id: app-token
       if: inputs.app-id != ''
-      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
       with:
         app-id: ${{ inputs.app-id }}
         private-key: ${{ inputs.app-private-key }}
@@ -172,7 +172,7 @@ runs:
     # annotations. Skipped on forks (read-only token) and when the toggle is off.
     - name: Ingest into code scanning
       if: inputs.code-scanning == 'true'
-      uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v3
+      uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
       with:
         sarif_file: reports/gandalf.sarif
         category: gandalf
